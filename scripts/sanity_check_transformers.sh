@@ -10,6 +10,7 @@ DTYPE="${DTYPE:-bfloat16}"
 LOADER="${LOADER:-naive}"
 TOP_K="${TOP_K:-5}"
 LAYERWISE="${LAYERWISE:-1}"
+BLOCKWISE="${BLOCKWISE:-1}"
 
 ARGS=(
   --prompt "$PROMPT"
@@ -21,6 +22,10 @@ ARGS=(
 
 if [[ "$LAYERWISE" == "1" ]]; then
   ARGS+=(--layerwise)
+fi
+
+if [[ "$BLOCKWISE" == "1" ]]; then
+  ARGS+=(--blockwise)
 fi
 
 exec uv run python scripts/sanity_check_transformers.py "${ARGS[@]}" "$@"

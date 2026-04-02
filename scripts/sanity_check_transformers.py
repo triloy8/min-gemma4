@@ -64,6 +64,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--loader", choices=("streamed", "naive"), default="naive")
     parser.add_argument("--top-k", type=int, default=5, help="How many top tokens to print.")
     parser.add_argument("--layerwise", action="store_true", help="Also compare embeddings, projected per-layer inputs, and each decoder layer output.")
+    parser.add_argument("--blockwise", action="store_true", help="Compare intermediate activations inside each decoder block.")
+    parser.add_argument("--blockwise-from", type=int, default=None, help="First decoder layer index to include in --blockwise output.")
+    parser.add_argument("--blockwise-to", type=int, default=None, help="Last decoder layer index to include in --blockwise output.")
     return parser.parse_args()
 
 
@@ -86,6 +89,8 @@ def load_hf_model(device: str, dtype: torch.dtype) -> torch.nn.Module:
 
     full_config = Gemma4Config.from_pretrained(str(CONFIG_DIR))
     hf_model = Gemma4ForCausalLM(full_config.text_config)
+    hf_model.config._attn_implementation = "eager"
+    hf_model.model.config._attn_implementation = "eager"
 
     full_state = load_file(str(WEIGHTS_PATH))
     text_state = {
@@ -210,21 +215,21 @@ def build_common_context(lm: torch.nn.Module, input_ids: torch.Tensor) -> tuple[
     return hidden_states, position_ids, masks, position_embeddings
 
 
-def compare_rope_tensors(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
-    ours_lm = ours_model.model.language_model
-    hf_lm = hf_model.model
-    _, _, _, ours_pos = build_common_context(ours_lm, input_ids)
-    _, _, _, hf_pos = build_common_context(hf_lm, input_ids)
-
-    print("--- rope ---")
-    for layer_type in sorted(ours_pos):
-        ours_cos, ours_sin = ours_pos[layer_type]
-        hf_cos, hf_sin = hf_pos[layer_type]
-        tensor_stats(f"{layer_type}_cos", ours_cos, hf_cos)
-        tensor_stats(f"{layer_type}_sin", ours_sin, hf_sin)
-
-
-def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+def run_prefix_layers(
+    ours_model: torch.nn.Module,
+    hf_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    stop_before_layer: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    dict[str, torch.Tensor],
+    dict[str, tuple[torch.Tensor, torch.Tensor]],
+    dict[str, torch.Tensor],
+    dict[str, tuple[torch.Tensor, torch.Tensor]],
+    torch.Tensor,
+    torch.Tensor,
+]:
     ours_lm = ours_model.model.language_model
     hf_lm = hf_model.model
 
@@ -234,7 +239,7 @@ def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn
     ours_per_layer = ours_lm.project_per_layer_inputs(ours_hidden, ours_lm.get_per_layer_inputs(input_ids))
     hf_per_layer = hf_lm.project_per_layer_inputs(hf_hidden, hf_lm.get_per_layer_inputs(input_ids, hf_hidden))
 
-    for idx in range(ours_lm.config.num_hidden_layers - 1):
+    for idx in range(stop_before_layer):
         layer_type = ours_lm.config.layer_types[idx]
         ours_hidden = ours_lm.layers[idx](
             hidden_states=ours_hidden,
@@ -251,60 +256,27 @@ def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn
             past_key_values=None,
         )
 
-    last_idx = ours_lm.config.num_hidden_layers - 1
-    layer_type = ours_lm.config.layer_types[last_idx]
-    ours_layer = ours_lm.layers[last_idx]
-    hf_layer = hf_lm.layers[last_idx]
+    return ours_hidden, hf_hidden, ours_masks, ours_pos, hf_masks, hf_pos, ours_per_layer, hf_per_layer
 
-    ours_normed = ours_layer.input_layernorm(ours_hidden)
-    hf_normed = hf_layer.input_layernorm(hf_hidden)
-    ours_attn = ours_layer.self_attn(ours_normed, ours_pos[layer_type], ours_masks[layer_type])
-    hf_attn, _ = hf_layer.self_attn(
-        hidden_states=hf_normed,
-        position_embeddings=hf_pos[layer_type],
-        attention_mask=hf_masks[layer_type],
-        position_ids=None,
-        past_key_values=None,
+
+def collect_block_activations(
+    ours_model: torch.nn.Module,
+    hf_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    layer_idx: int,
+) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    ours_lm = ours_model.model.language_model
+    hf_lm = hf_model.model
+
+    ours_hidden, hf_hidden, ours_masks, ours_pos, hf_masks, hf_pos, ours_per_layer, hf_per_layer = run_prefix_layers(
+        ours_model, hf_model, input_ids, stop_before_layer=layer_idx
     )
 
-    print("--- last layer attention ---")
-    tensor_stats("layer_41_input_normed", ours_normed, hf_normed)
-    tensor_stats("layer_41_attn_output", ours_attn, hf_attn)
-
-
-def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
-    ours_lm = ours_model.model.language_model
-    hf_lm = hf_model.model
-
-    ours_hidden, _, ours_masks, ours_pos = build_common_context(ours_lm, input_ids)
-    hf_hidden, _, hf_masks, hf_pos = build_common_context(hf_lm, input_ids)
-
-    ours_per_layer = ours_lm.project_per_layer_inputs(ours_hidden, ours_lm.get_per_layer_inputs(input_ids))
-    hf_per_layer = hf_lm.project_per_layer_inputs(hf_hidden, hf_lm.get_per_layer_inputs(input_ids, hf_hidden))
-
-    for idx in range(ours_lm.config.num_hidden_layers - 1):
-        layer_type = ours_lm.config.layer_types[idx]
-        ours_hidden = ours_lm.layers[idx](
-            hidden_states=ours_hidden,
-            per_layer_input=ours_per_layer[:, :, idx, :],
-            position_embeddings=ours_pos[layer_type],
-            attention_mask=ours_masks[layer_type],
-        )
-        hf_hidden = hf_lm.layers[idx](
-            hf_hidden,
-            hf_per_layer[:, :, idx, :],
-            position_embeddings=hf_pos[layer_type],
-            attention_mask=hf_masks[layer_type],
-            position_ids=None,
-            past_key_values=None,
-        )
-
-    last_idx = ours_lm.config.num_hidden_layers - 1
-    layer_type = ours_lm.config.layer_types[last_idx]
-    ours_layer = ours_lm.layers[last_idx]
-    hf_layer = hf_lm.layers[last_idx]
-    ours_pli = ours_per_layer[:, :, last_idx, :]
-    hf_pli = hf_per_layer[:, :, last_idx, :]
+    layer_type = ours_lm.config.layer_types[layer_idx]
+    ours_layer = ours_lm.layers[layer_idx]
+    hf_layer = hf_lm.layers[layer_idx]
+    ours_pli = ours_per_layer[:, :, layer_idx, :]
+    hf_pli = hf_per_layer[:, :, layer_idx, :]
 
     ours_residual_0 = ours_hidden
     hf_residual_0 = hf_hidden
@@ -366,23 +338,92 @@ def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Mod
     ours_final = ours_after_pli * ours_layer.layer_scalar
     hf_final = hf_after_pli * hf_layer.layer_scalar
 
+    return {
+        "residual_in": (ours_residual_0, hf_residual_0),
+        "input_ln": (ours_input_ln, hf_input_ln),
+        "attn": (ours_attn, hf_attn),
+        "post_attn_ln": (ours_post_attn_ln, hf_post_attn_ln),
+        "after_attn": (ours_after_attn, hf_after_attn),
+        "pre_ffn_ln": (ours_pre_ffn_ln, hf_pre_ffn_ln),
+        "mlp": (ours_mlp, hf_mlp),
+        "post_ffn_ln": (ours_post_ffn_ln, hf_post_ffn_ln),
+        "after_ffn": (ours_after_ffn, hf_after_ffn),
+        "pli_gate": (ours_pli_gate, hf_pli_gate),
+        "pli_act": (ours_pli_act, hf_pli_act),
+        "pli_mul": (ours_pli_mul, hf_pli_mul),
+        "pli_proj": (ours_pli_proj, hf_pli_proj),
+        "post_pli_ln": (ours_post_pli_ln, hf_post_pli_ln),
+        "after_pli": (ours_after_pli, hf_after_pli),
+        "final": (ours_final, hf_final),
+    }
+
+
+def print_block_activations(
+    ours_model: torch.nn.Module,
+    hf_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    layer_idx: int,
+) -> None:
+    activations = collect_block_activations(ours_model, hf_model, input_ids, layer_idx)
+    print(f"--- layer_{layer_idx} block ---")
+    for name, (ours, hf) in activations.items():
+        tensor_stats(f"layer_{layer_idx}_{name}", ours, hf)
+
+
+def print_blockwise_report(
+    ours_model: torch.nn.Module,
+    hf_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    layer_start: int | None = None,
+    layer_end: int | None = None,
+) -> None:
+    num_layers = ours_model.model.language_model.config.num_hidden_layers
+    start = 0 if layer_start is None else max(0, layer_start)
+    end = num_layers - 1 if layer_end is None else min(num_layers - 1, layer_end)
+
+    if start > end:
+        raise ValueError(f"invalid blockwise range: start={start} end={end}")
+
+    print("--- blockwise ---")
+    for layer_idx in range(start, end + 1):
+        print_block_activations(ours_model, hf_model, input_ids, layer_idx)
+
+
+def compare_rope_tensors(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+    ours_lm = ours_model.model.language_model
+    hf_lm = hf_model.model
+    _, _, _, ours_pos = build_common_context(ours_lm, input_ids)
+    _, _, _, hf_pos = build_common_context(hf_lm, input_ids)
+
+    print("--- rope ---")
+    for layer_type in sorted(ours_pos):
+        ours_cos, ours_sin = ours_pos[layer_type]
+        hf_cos, hf_sin = hf_pos[layer_type]
+        tensor_stats(f"{layer_type}_cos", ours_cos, hf_cos)
+        tensor_stats(f"{layer_type}_sin", ours_sin, hf_sin)
+
+
+def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+    ours_lm = ours_model.model.language_model
+    hf_lm = hf_model.model
+
+    last_idx = ours_lm.config.num_hidden_layers - 1
+    activations = collect_block_activations(ours_model, hf_model, input_ids, last_idx)
+    ours_normed, hf_normed = activations["input_ln"]
+    ours_attn, hf_attn = activations["attn"]
+
+    print("--- last layer attention ---")
+    tensor_stats("layer_41_input_normed", ours_normed, hf_normed)
+    tensor_stats("layer_41_attn_output", ours_attn, hf_attn)
+
+
+def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+    last_idx = ours_model.model.language_model.config.num_hidden_layers - 1
+    activations = collect_block_activations(ours_model, hf_model, input_ids, last_idx)
+
     print("--- last layer block ---")
-    tensor_stats("layer_41_residual_in", ours_residual_0, hf_residual_0)
-    tensor_stats("layer_41_input_ln", ours_input_ln, hf_input_ln)
-    tensor_stats("layer_41_attn", ours_attn, hf_attn)
-    tensor_stats("layer_41_post_attn_ln", ours_post_attn_ln, hf_post_attn_ln)
-    tensor_stats("layer_41_after_attn", ours_after_attn, hf_after_attn)
-    tensor_stats("layer_41_pre_ffn_ln", ours_pre_ffn_ln, hf_pre_ffn_ln)
-    tensor_stats("layer_41_mlp", ours_mlp, hf_mlp)
-    tensor_stats("layer_41_post_ffn_ln", ours_post_ffn_ln, hf_post_ffn_ln)
-    tensor_stats("layer_41_after_ffn", ours_after_ffn, hf_after_ffn)
-    tensor_stats("layer_41_pli_gate", ours_pli_gate, hf_pli_gate)
-    tensor_stats("layer_41_pli_act", ours_pli_act, hf_pli_act)
-    tensor_stats("layer_41_pli_mul", ours_pli_mul, hf_pli_mul)
-    tensor_stats("layer_41_pli_proj", ours_pli_proj, hf_pli_proj)
-    tensor_stats("layer_41_post_pli_ln", ours_post_pli_ln, hf_post_pli_ln)
-    tensor_stats("layer_41_after_pli", ours_after_pli, hf_after_pli)
-    tensor_stats("layer_41_final", ours_final, hf_final)
+    for name, (ours, hf) in activations.items():
+        tensor_stats(f"layer_41_{name}", ours, hf)
 
 
 def main() -> None:
@@ -423,6 +464,15 @@ def main() -> None:
             compare_rope_tensors(ours, hf, input_ids.to(args.device))
             compare_last_layer_attention(ours, hf, input_ids.to(args.device))
             compare_last_layer_block(ours, hf, input_ids.to(args.device))
+    if args.blockwise:
+        with torch.inference_mode():
+            print_blockwise_report(
+                ours,
+                hf,
+                input_ids.to(args.device),
+                layer_start=args.blockwise_from,
+                layer_end=args.blockwise_to,
+            )
 
 
 if __name__ == "__main__":
