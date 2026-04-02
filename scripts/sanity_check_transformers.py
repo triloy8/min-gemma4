@@ -83,7 +83,7 @@ def load_hf_model(device: str, dtype: torch.dtype) -> torch.nn.Module:
 
     full_state = load_file(str(WEIGHTS_PATH))
     text_state = {
-        key.removeprefix("model.language_model."): value
+        f"model.{key.removeprefix('model.language_model.')}": value
         for key, value in full_state.items()
         if key.startswith("model.language_model.")
     }
