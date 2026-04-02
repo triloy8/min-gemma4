@@ -14,7 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import build_model, build_model_naive
+from model import (
+    build_causal_mask,
+    build_model,
+    build_model_naive,
+    build_sliding_causal_mask,
+)
 
 
 TOKENIZER_PATH = ROOT / "config" / "tokenizer.json"
@@ -58,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--loader", choices=("streamed", "naive"), default="naive")
     parser.add_argument("--top-k", type=int, default=5, help="How many top tokens to print.")
+    parser.add_argument("--layerwise", action="store_true", help="Also compare embeddings, projected per-layer inputs, and each decoder layer output.")
     return parser.parse_args()
 
 
@@ -108,6 +114,88 @@ def top_tokens(logits: torch.Tensor, tokenizer: LocalTokenizer, k: int) -> list[
     return result
 
 
+def tensor_stats(name: str, ours: torch.Tensor, hf: torch.Tensor) -> None:
+    diff = (ours.float() - hf.float()).abs()
+    print(name, "shape", tuple(ours.shape), "max_abs_diff", diff.max().item(), "mean_abs_diff", diff.mean().item())
+
+
+def collect_ours_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+    lm = model.model.language_model
+    hidden_states = lm.embed_tokens(input_ids)
+    raw_per_layer = lm.get_per_layer_inputs(input_ids)
+    projected_per_layer = lm.project_per_layer_inputs(hidden_states, raw_per_layer)
+
+    batch, seq_len = input_ids.shape
+    position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch, -1)
+    masks = {
+        "full_attention": build_causal_mask(seq_len, input_ids.device, hidden_states.dtype),
+        "sliding_attention": build_sliding_causal_mask(seq_len, lm.config.sliding_window, input_ids.device, hidden_states.dtype),
+    }
+    position_embeddings = {
+        layer_type: lm.rotary_emb(hidden_states, position_ids, layer_type) for layer_type in set(lm.config.layer_types)
+    }
+
+    out: dict[str, torch.Tensor] = {
+        "embed": hidden_states.detach(),
+        "per_layer_projected": projected_per_layer.detach(),
+    }
+
+    for idx, layer in enumerate(lm.layers):
+        layer_type = lm.config.layer_types[idx]
+        hidden_states = layer(
+            hidden_states=hidden_states,
+            per_layer_input=projected_per_layer[:, :, idx, :],
+            position_embeddings=position_embeddings[layer_type],
+            attention_mask=masks[layer_type],
+        )
+        out[f"layer_{idx}"] = hidden_states.detach()
+
+    out["final_norm"] = lm.norm(hidden_states).detach()
+    out["logits"] = model(input_ids).detach()
+    return out
+
+
+def collect_hf_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
+    lm = model.model
+    inputs_embeds = lm.embed_tokens(input_ids)
+    raw_per_layer = lm.get_per_layer_inputs(input_ids, inputs_embeds)
+    projected_per_layer = lm.project_per_layer_inputs(inputs_embeds, raw_per_layer)
+    outputs = model(input_ids=input_ids, output_hidden_states=True, use_cache=False, return_dict=True)
+
+    out: dict[str, torch.Tensor] = {
+        "embed": inputs_embeds.detach(),
+        "per_layer_projected": projected_per_layer.detach(),
+    }
+    for idx, hidden in enumerate(outputs.hidden_states[1:]):
+        out[f"layer_{idx}"] = hidden.detach()
+    out["final_norm"] = outputs.hidden_states[-1].detach()
+    out["logits"] = outputs.logits.detach()
+    return out
+
+
+def print_layerwise_report(ours: dict[str, torch.Tensor], hf: dict[str, torch.Tensor]) -> None:
+    print("--- layerwise ---")
+    tensor_stats("embed", ours["embed"], hf["embed"])
+    tensor_stats("per_layer_projected", ours["per_layer_projected"], hf["per_layer_projected"])
+
+    first_bad = None
+    layer_keys = sorted(k for k in ours if k.startswith("layer_"))
+    for key in layer_keys:
+        diff = (ours[key].float() - hf[key].float()).abs()
+        max_diff = diff.max().item()
+        mean_diff = diff.mean().item()
+        print(key, "max_abs_diff", max_diff, "mean_abs_diff", mean_diff)
+        if first_bad is None and max_diff > 1e-2:
+            first_bad = key
+
+    tensor_stats("final_norm", ours["final_norm"], hf["final_norm"])
+    tensor_stats("logits", ours["logits"], hf["logits"])
+    if first_bad is not None:
+        print("first_large_divergence", first_bad)
+    else:
+        print("first_large_divergence", "none")
+
+
 def main() -> None:
     args = parse_args()
     dtype = choose_dtype(args.dtype)
@@ -136,6 +224,12 @@ def main() -> None:
     print("--- hf top tokens ---")
     for token_id, score, text in top_tokens(hf_logits, tokenizer, args.top_k):
         print(token_id, score, repr(text))
+
+    if args.layerwise:
+        with torch.inference_mode():
+            ours_stages = collect_ours_stages(ours, input_ids.to(args.device))
+            hf_stages = collect_hf_stages(hf, input_ids.to(args.device))
+        print_layerwise_report(ours_stages, hf_stages)
 
 
 if __name__ == "__main__":

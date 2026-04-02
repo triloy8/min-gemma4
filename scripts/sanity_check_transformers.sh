@@ -9,6 +9,7 @@ DEVICE="${DEVICE:-cpu}"
 DTYPE="${DTYPE:-bfloat16}"
 LOADER="${LOADER:-naive}"
 TOP_K="${TOP_K:-5}"
+LAYERWISE="${LAYERWISE:-0}"
 
 ARGS=(
   --prompt "$PROMPT"
@@ -17,5 +18,9 @@ ARGS=(
   --loader "$LOADER"
   --top-k "$TOP_K"
 )
+
+if [[ "$LAYERWISE" == "1" ]]; then
+  ARGS+=(--layerwise)
+fi
 
 exec uv run python scripts/sanity_check_transformers.py "${ARGS[@]}" "$@"
