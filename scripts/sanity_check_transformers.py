@@ -272,6 +272,119 @@ def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn
     tensor_stats("layer_41_attn_output", ours_attn, hf_attn)
 
 
+def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+    ours_lm = ours_model.model.language_model
+    hf_lm = hf_model.model
+
+    ours_hidden, _, ours_masks, ours_pos = build_common_context(ours_lm, input_ids)
+    hf_hidden, _, hf_masks, hf_pos = build_common_context(hf_lm, input_ids)
+
+    ours_per_layer = ours_lm.project_per_layer_inputs(ours_hidden, ours_lm.get_per_layer_inputs(input_ids))
+    hf_per_layer = hf_lm.project_per_layer_inputs(hf_hidden, hf_lm.get_per_layer_inputs(input_ids, hf_hidden))
+
+    for idx in range(ours_lm.config.num_hidden_layers - 1):
+        layer_type = ours_lm.config.layer_types[idx]
+        ours_hidden = ours_lm.layers[idx](
+            hidden_states=ours_hidden,
+            per_layer_input=ours_per_layer[:, :, idx, :],
+            position_embeddings=ours_pos[layer_type],
+            attention_mask=ours_masks[layer_type],
+        )
+        hf_hidden = hf_lm.layers[idx](
+            hf_hidden,
+            hf_per_layer[:, :, idx, :],
+            position_embeddings=hf_pos[layer_type],
+            attention_mask=hf_masks[layer_type],
+            position_ids=None,
+            past_key_values=None,
+        )
+
+    last_idx = ours_lm.config.num_hidden_layers - 1
+    layer_type = ours_lm.config.layer_types[last_idx]
+    ours_layer = ours_lm.layers[last_idx]
+    hf_layer = hf_lm.layers[last_idx]
+    ours_pli = ours_per_layer[:, :, last_idx, :]
+    hf_pli = hf_per_layer[:, :, last_idx, :]
+
+    ours_residual_0 = ours_hidden
+    hf_residual_0 = hf_hidden
+
+    ours_input_ln = ours_layer.input_layernorm(ours_hidden)
+    hf_input_ln = hf_layer.input_layernorm(hf_hidden)
+
+    ours_attn = ours_layer.self_attn(ours_input_ln, ours_pos[layer_type], ours_masks[layer_type])
+    hf_attn, _ = hf_layer.self_attn(
+        hidden_states=hf_input_ln,
+        position_embeddings=hf_pos[layer_type],
+        attention_mask=hf_masks[layer_type],
+        position_ids=None,
+        past_key_values=None,
+    )
+
+    ours_post_attn_ln = ours_layer.post_attention_layernorm(ours_attn)
+    hf_post_attn_ln = hf_layer.post_attention_layernorm(hf_attn)
+
+    ours_after_attn = ours_residual_0 + ours_post_attn_ln
+    hf_after_attn = hf_residual_0 + hf_post_attn_ln
+
+    ours_residual_1 = ours_after_attn
+    hf_residual_1 = hf_after_attn
+
+    ours_pre_ffn_ln = ours_layer.pre_feedforward_layernorm(ours_after_attn)
+    hf_pre_ffn_ln = hf_layer.pre_feedforward_layernorm(hf_after_attn)
+
+    ours_mlp = ours_layer.mlp(ours_pre_ffn_ln)
+    hf_mlp = hf_layer.mlp(hf_pre_ffn_ln)
+
+    ours_post_ffn_ln = ours_layer.post_feedforward_layernorm(ours_mlp)
+    hf_post_ffn_ln = hf_layer.post_feedforward_layernorm(hf_mlp)
+
+    ours_after_ffn = ours_residual_1 + ours_post_ffn_ln
+    hf_after_ffn = hf_residual_1 + hf_post_ffn_ln
+
+    ours_residual_2 = ours_after_ffn
+    hf_residual_2 = hf_after_ffn
+
+    ours_pli_gate = ours_layer.per_layer_input_gate(ours_after_ffn)
+    hf_pli_gate = hf_layer.per_layer_input_gate(hf_after_ffn)
+
+    ours_pli_act = ours_layer.act_fn(ours_pli_gate)
+    hf_pli_act = hf_layer.act_fn(hf_pli_gate)
+
+    ours_pli_mul = ours_pli_act * ours_pli
+    hf_pli_mul = hf_pli_act * hf_pli
+
+    ours_pli_proj = ours_layer.per_layer_projection(ours_pli_mul)
+    hf_pli_proj = hf_layer.per_layer_projection(hf_pli_mul)
+
+    ours_post_pli_ln = ours_layer.post_per_layer_input_norm(ours_pli_proj)
+    hf_post_pli_ln = hf_layer.post_per_layer_input_norm(hf_pli_proj)
+
+    ours_after_pli = ours_residual_2 + ours_post_pli_ln
+    hf_after_pli = hf_residual_2 + hf_post_pli_ln
+
+    ours_final = ours_after_pli * ours_layer.layer_scalar
+    hf_final = hf_after_pli * hf_layer.layer_scalar
+
+    print("--- last layer block ---")
+    tensor_stats("layer_41_residual_in", ours_residual_0, hf_residual_0)
+    tensor_stats("layer_41_input_ln", ours_input_ln, hf_input_ln)
+    tensor_stats("layer_41_attn", ours_attn, hf_attn)
+    tensor_stats("layer_41_post_attn_ln", ours_post_attn_ln, hf_post_attn_ln)
+    tensor_stats("layer_41_after_attn", ours_after_attn, hf_after_attn)
+    tensor_stats("layer_41_pre_ffn_ln", ours_pre_ffn_ln, hf_pre_ffn_ln)
+    tensor_stats("layer_41_mlp", ours_mlp, hf_mlp)
+    tensor_stats("layer_41_post_ffn_ln", ours_post_ffn_ln, hf_post_ffn_ln)
+    tensor_stats("layer_41_after_ffn", ours_after_ffn, hf_after_ffn)
+    tensor_stats("layer_41_pli_gate", ours_pli_gate, hf_pli_gate)
+    tensor_stats("layer_41_pli_act", ours_pli_act, hf_pli_act)
+    tensor_stats("layer_41_pli_mul", ours_pli_mul, hf_pli_mul)
+    tensor_stats("layer_41_pli_proj", ours_pli_proj, hf_pli_proj)
+    tensor_stats("layer_41_post_pli_ln", ours_post_pli_ln, hf_post_pli_ln)
+    tensor_stats("layer_41_after_pli", ours_after_pli, hf_after_pli)
+    tensor_stats("layer_41_final", ours_final, hf_final)
+
+
 def main() -> None:
     args = parse_args()
     dtype = choose_dtype(args.dtype)
@@ -309,6 +422,7 @@ def main() -> None:
         with torch.inference_mode():
             compare_rope_tensors(ours, hf, input_ids.to(args.device))
             compare_last_layer_attention(ours, hf, input_ids.to(args.device))
+            compare_last_layer_block(ours, hf, input_ids.to(args.device))
 
 
 if __name__ == "__main__":
