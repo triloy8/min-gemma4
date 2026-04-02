@@ -196,6 +196,82 @@ def print_layerwise_report(ours: dict[str, torch.Tensor], hf: dict[str, torch.Te
         print("first_large_divergence", "none")
 
 
+def build_common_context(lm: torch.nn.Module, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, torch.Tensor]]]:
+    hidden_states = lm.embed_tokens(input_ids)
+    batch, seq_len = input_ids.shape
+    position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch, -1)
+    masks = {
+        "full_attention": build_causal_mask(seq_len, input_ids.device, hidden_states.dtype),
+        "sliding_attention": build_sliding_causal_mask(seq_len, lm.config.sliding_window, input_ids.device, hidden_states.dtype),
+    }
+    position_embeddings = {
+        layer_type: lm.rotary_emb(hidden_states, position_ids, layer_type) for layer_type in set(lm.config.layer_types)
+    }
+    return hidden_states, position_ids, masks, position_embeddings
+
+
+def compare_rope_tensors(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+    ours_lm = ours_model.model.language_model
+    hf_lm = hf_model.model
+    _, _, _, ours_pos = build_common_context(ours_lm, input_ids)
+    _, _, _, hf_pos = build_common_context(hf_lm, input_ids)
+
+    print("--- rope ---")
+    for layer_type in sorted(ours_pos):
+        ours_cos, ours_sin = ours_pos[layer_type]
+        hf_cos, hf_sin = hf_pos[layer_type]
+        tensor_stats(f"{layer_type}_cos", ours_cos, hf_cos)
+        tensor_stats(f"{layer_type}_sin", ours_sin, hf_sin)
+
+
+def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+    ours_lm = ours_model.model.language_model
+    hf_lm = hf_model.model
+
+    ours_hidden, _, ours_masks, ours_pos = build_common_context(ours_lm, input_ids)
+    hf_hidden, _, hf_masks, hf_pos = build_common_context(hf_lm, input_ids)
+
+    ours_per_layer = ours_lm.project_per_layer_inputs(ours_hidden, ours_lm.get_per_layer_inputs(input_ids))
+    hf_per_layer = hf_lm.project_per_layer_inputs(hf_hidden, hf_lm.get_per_layer_inputs(input_ids, hf_hidden))
+
+    for idx in range(ours_lm.config.num_hidden_layers - 1):
+        layer_type = ours_lm.config.layer_types[idx]
+        ours_hidden = ours_lm.layers[idx](
+            hidden_states=ours_hidden,
+            per_layer_input=ours_per_layer[:, :, idx, :],
+            position_embeddings=ours_pos[layer_type],
+            attention_mask=ours_masks[layer_type],
+        )
+        hf_hidden = hf_lm.layers[idx](
+            hf_hidden,
+            hf_per_layer[:, :, idx, :],
+            position_embeddings=hf_pos[layer_type],
+            attention_mask=hf_masks[layer_type],
+            position_ids=None,
+            past_key_values=None,
+        )
+
+    last_idx = ours_lm.config.num_hidden_layers - 1
+    layer_type = ours_lm.config.layer_types[last_idx]
+    ours_layer = ours_lm.layers[last_idx]
+    hf_layer = hf_lm.layers[last_idx]
+
+    ours_normed = ours_layer.input_layernorm(ours_hidden)
+    hf_normed = hf_layer.input_layernorm(hf_hidden)
+    ours_attn = ours_layer.self_attn(ours_normed, ours_pos[layer_type], ours_masks[layer_type])
+    hf_attn, _ = hf_layer.self_attn(
+        hidden_states=hf_normed,
+        position_embeddings=hf_pos[layer_type],
+        attention_mask=hf_masks[layer_type],
+        position_ids=None,
+        past_key_values=None,
+    )
+
+    print("--- last layer attention ---")
+    tensor_stats("layer_41_input_normed", ours_normed, hf_normed)
+    tensor_stats("layer_41_attn_output", ours_attn, hf_attn)
+
+
 def main() -> None:
     args = parse_args()
     dtype = choose_dtype(args.dtype)
@@ -230,6 +306,9 @@ def main() -> None:
             ours_stages = collect_ours_stages(ours, input_ids.to(args.device))
             hf_stages = collect_hf_stages(hf, input_ids.to(args.device))
         print_layerwise_report(ours_stages, hf_stages)
+        with torch.inference_mode():
+            compare_rope_tensors(ours, hf, input_ids.to(args.device))
+            compare_last_layer_attention(ours, hf, input_ids.to(args.device))
 
 
 if __name__ == "__main__":
