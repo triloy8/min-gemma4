@@ -9,7 +9,7 @@ DEVICE="${DEVICE:-cpu}"
 DTYPE="${DTYPE:-bfloat16}"
 LOADER="${LOADER:-naive}"
 TOP_K="${TOP_K:-5}"
-LAYERWISE="${LAYERWISE:-0}"
+LAYERWISE="${LAYERWISE:-1}"
 
 ARGS=(
   --prompt "$PROMPT"

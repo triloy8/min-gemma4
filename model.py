@@ -231,6 +231,7 @@ class Gemma4TextAttention(nn.Module):
         self.num_key_value_groups = config.num_attention_heads // num_key_value_heads
         self.q_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.v_norm = Gemma4RMSNorm(self.head_dim, eps=config.rms_norm_eps, with_scale=False)
         self.v_proj = nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.q_proj = nn.Linear(config.hidden_size, config.num_attention_heads * self.head_dim, bias=config.attention_bias)
         self.k_proj = nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
@@ -249,12 +250,13 @@ class Gemma4TextAttention(nn.Module):
         key_states = self.k_norm(key_states)
         key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
 
-        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape)
+        value_states = self.v_norm(value_states).transpose(1, 2)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) * (self.head_dim**-0.5)
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3))
         attn_weights = attn_weights + attention_mask
         attn_weights = F.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
         attn_output = torch.matmul(attn_weights, value_states)
