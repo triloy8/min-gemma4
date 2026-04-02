@@ -1,0 +1,17 @@
+[project]
+name = "min-gemma4"
+version = "0.1.0"
+description = "Minimal uv scaffold for Gemma 4 experiments."
+requires-python = ">=3.11"
+dependencies = [
+    "safetensors>=0.5.3",
+    "tokenizers>=0.22.0",
+    "torch>=2.6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = false
