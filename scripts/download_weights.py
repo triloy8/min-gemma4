@@ -27,6 +27,11 @@ def parse_args() -> argparse.Namespace:
         default=str(ROOT / "model.safetensors"),
         help="Destination path for the downloaded safetensors file.",
     )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Overwrite the destination if it already exists.",
+    )
     return parser.parse_args()
 
 
@@ -35,6 +40,9 @@ def main() -> None:
     url = VARIANT_URLS[args.variant]
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
+
+    if output.exists() and not args.force:
+        raise SystemExit(f"refusing to overwrite existing file: {output} (use --force)")
 
     print(f"variant {args.variant}")
     print(f"url {url}")

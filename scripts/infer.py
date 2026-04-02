@@ -22,14 +22,16 @@ TOKENIZER_CONFIG_PATH = ROOT / "config" / "tokenizer_config.json"
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Minimal text-only Gemma 4 inference entrypoint.")
-    parser.add_argument("--prompt", default="Hello.", help="User message to send through the chat template.")
-    parser.add_argument("--max-new-tokens", type=int, default=16, help="Number of tokens to generate.")
+    parser.add_argument("--prompt", help="User message to send through the chat template.")
+    parser.add_argument("--prompt-file", help="Read the user prompt from a file.")
+    parser.add_argument("--max-new-tokens", type=int, default=32, help="Number of tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.0, help="0.0 means greedy decoding.")
     parser.add_argument("--top-k", type=int, default=0, help="Optional top-k sampling cutoff.")
+    parser.add_argument("--seed", type=int, default=0, help="Sampling seed. Used when temperature > 0.")
     parser.add_argument(
         "--loader",
         choices=("streamed", "naive"),
-        default="streamed",
+        default="naive",
         help="Weight loading strategy.",
     )
     parser.add_argument(
@@ -39,7 +41,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dtype",
-        choices=("bfloat16", "float32"),
+        choices=("bfloat16", "float16", "float32"),
         default="bfloat16",
         help="Model dtype used during loading and inference.",
     )
@@ -48,12 +50,28 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only validate checkpoint names and shapes against the extracted text model.",
     )
+    parser.add_argument(
+        "--skip-validate",
+        action="store_true",
+        help="Skip the checkpoint key and shape validation before inference.",
+    )
+    parser.add_argument(
+        "--show-prompt",
+        action="store_true",
+        help="Print the fully formatted prompt string before inference.",
+    )
+    parser.add_argument(
+        "--skip-special-tokens",
+        action="store_true",
+        help="Drop special tokens from the decoded output.",
+    )
     return parser.parse_args()
 
 
 def choose_dtype(name: str) -> torch.dtype:
     return {
         "bfloat16": torch.bfloat16,
+        "float16": torch.float16,
         "float32": torch.float32,
     }[name]
 
@@ -109,6 +127,7 @@ def generate(
     temperature: float,
     top_k: int,
     device: str,
+    skip_special_tokens: bool,
 ) -> tuple[torch.Tensor, str]:
     generated = input_ids.to(device)
     with torch.no_grad():
@@ -118,30 +137,50 @@ def generate(
             generated = torch.cat([generated, next_token], dim=1)
             if next_token.item() == tokenizer.eos_token_id:
                 break
-    text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=False)
+    text = tokenizer.decode(generated[0].tolist(), skip_special_tokens=skip_special_tokens)
     return generated, text
+
+
+def resolve_prompt(args: argparse.Namespace) -> str:
+    if args.prompt_file:
+        return Path(args.prompt_file).read_text().rstrip()
+    if args.prompt is not None:
+        return args.prompt
+    return "Hello."
 
 
 def main() -> None:
     args = parse_args()
     config = Gemma4TextConfig.from_file()
-    keys = list_text_keys()
-    expected, available = validate_text_checkpoint()
+    prompt = resolve_prompt(args)
 
-    print("validated")
-    print("text_layers", config.num_hidden_layers)
-    print("text_tensors", len(keys))
-    print("expected", expected)
-    print("available", available)
-
-    if args.validate_only:
-        return
+    if not args.skip_validate or args.validate_only:
+        keys = list_text_keys()
+        expected, available = validate_text_checkpoint()
+        print("validated")
+        print("text_layers", config.num_hidden_layers)
+        print("text_tensors", len(keys))
+        print("expected", expected)
+        print("available", available)
+        if args.validate_only:
+            return
 
     tokenizer = LocalTokenizer()
-    input_ids = tokenizer.encode_chat_prompt(args.prompt)
+    formatted_prompt = tokenizer.format_user_prompt(prompt)
+    input_ids = tokenizer.encode_chat_prompt(prompt)
+
+    if args.show_prompt:
+        print("--- prompt ---")
+        print(formatted_prompt)
+        print("--------------")
 
     builder = build_model if args.loader == "streamed" else build_model_naive
     model = builder(device=args.device, dtype=choose_dtype(args.dtype))
+
+    if args.temperature > 0.0:
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
 
     generated_ids, generated_text = generate(
         model=model,
@@ -151,10 +190,12 @@ def main() -> None:
         temperature=args.temperature,
         top_k=args.top_k,
         device=args.device,
+        skip_special_tokens=args.skip_special_tokens,
     )
 
     print("loader", args.loader)
     print("device", args.device)
+    print("dtype", args.dtype)
     print("prompt_tokens", input_ids.shape[-1])
     print("total_tokens", generated_ids.shape[-1])
     print("---")
