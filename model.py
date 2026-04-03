@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,6 +10,7 @@ import torch.nn.functional as F
 from safetensors import safe_open
 from safetensors.torch import load_file
 from torch import nn
+from tqdm.auto import tqdm
 
 
 ROOT = Path(__file__).resolve().parent
@@ -24,8 +26,6 @@ ACT2FN = {
     "gelu_pytorch_tanh": gelu_pytorch_tanh,
     "silu": F.silu,
 }
-
-
 @dataclass
 class Gemma4TextConfig:
     attention_bias: bool
@@ -576,12 +576,17 @@ def list_text_keys(path: str | Path = WEIGHTS_PATH) -> list[str]:
         return [k for k in f.keys() if k.startswith("model.language_model.")]
 
 
-def load_text_state_dict(path: str | Path = WEIGHTS_PATH) -> dict[str, torch.Tensor]:
+def load_text_state_dict(path: str | Path = WEIGHTS_PATH, show_progress: bool = False) -> dict[str, torch.Tensor]:
     state_dict = load_file(str(path))
-    return {k: v for k, v in state_dict.items() if k.startswith("model.language_model.")}
+    keys = [k for k in state_dict if k.startswith("model.language_model.")]
+    key_iter = tqdm(keys, total=len(keys), desc="Loading weights", leave=False) if show_progress else keys
+    return {
+        key: state_dict[key]
+        for key in key_iter
+    }
 
 
-def stream_load_text_weights(model: nn.Module, path: str | Path = WEIGHTS_PATH) -> None:
+def stream_load_text_weights(model: nn.Module, path: str | Path = WEIGHTS_PATH, show_progress: bool = False) -> None:
     model_state = model.state_dict()
     expected = set(model_state.keys())
     with safe_open(str(path), framework="pt") as f:
@@ -591,7 +596,8 @@ def stream_load_text_weights(model: nn.Module, path: str | Path = WEIGHTS_PATH) 
         if missing or unexpected:
             raise RuntimeError(f"missing={missing[:10]} unexpected={unexpected[:10]}")
 
-        for key in model_state:
+        key_iter = tqdm(model_state, total=len(model_state), desc="Loading weights", leave=False) if show_progress else model_state
+        for key in key_iter:
             tensor = f.get_tensor(key)
             target = model_state[key]
             if tensor.shape != target.shape:
@@ -622,18 +628,30 @@ def validate_text_checkpoint(path: str | Path = WEIGHTS_PATH) -> tuple[int, int]
     return len(expected), len(available)
 
 
-def build_model_naive(device: str | torch.device = "cpu", dtype: torch.dtype = torch.bfloat16) -> Gemma4TextOnly:
+def build_model_naive(
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+    show_progress: bool | None = None,
+) -> Gemma4TextOnly:
+    if show_progress is None:
+        show_progress = sys.stderr.isatty()
     config = Gemma4TextConfig.from_file()
     model = Gemma4TextOnly(config).to(device=device, dtype=dtype)
-    text_state = load_text_state_dict()
+    text_state = load_text_state_dict(show_progress=show_progress)
     missing, unexpected = model.load_state_dict(text_state, strict=True)
     if missing or unexpected:
         raise RuntimeError(f"missing={missing} unexpected={unexpected}")
     return model.eval()
 
 
-def build_model(device: str | torch.device = "cpu", dtype: torch.dtype = torch.bfloat16) -> Gemma4TextOnly:
+def build_model(
+    device: str | torch.device = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
+    show_progress: bool | None = None,
+) -> Gemma4TextOnly:
+    if show_progress is None:
+        show_progress = sys.stderr.isatty()
     config = Gemma4TextConfig.from_file()
     model = Gemma4TextOnly(config).to(device=device, dtype=dtype)
-    stream_load_text_weights(model)
+    stream_load_text_weights(model, show_progress=show_progress)
     return model.to(device=device, dtype=dtype).eval()

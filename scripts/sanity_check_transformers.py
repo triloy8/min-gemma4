@@ -63,6 +63,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--loader", choices=("streamed", "naive"), default="naive")
     parser.add_argument("--use-cache", action="store_true", help="Compare the cached decoding path instead of the no-cache prefill path.")
+    parser.add_argument("--decode-steps", type=int, default=0, help="After cached prefill, decode this many greedy steps token-by-token and compare logits at each step.")
     parser.add_argument("--top-k", type=int, default=5, help="How many top tokens to print.")
     parser.add_argument("--layerwise", action="store_true", help="Also compare embeddings, projected per-layer inputs, and each decoder layer output.")
     parser.add_argument("--blockwise", action="store_true", help="Compare intermediate activations inside each decoder block.")
@@ -462,8 +463,50 @@ def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Mod
         tensor_stats(f"layer_41_{name}", ours, hf)
 
 
+def print_cached_decode_report(
+    ours_model: torch.nn.Module,
+    hf_model: torch.nn.Module,
+    tokenizer: LocalTokenizer,
+    input_ids: torch.Tensor,
+    decode_steps: int,
+) -> None:
+    print("--- cached decode ---")
+    with torch.inference_mode():
+        our_logits, our_cache = ours_model(input_ids, use_cache=True)
+        hf_outputs = hf_model(input_ids=input_ids, use_cache=True)
+        hf_logits = hf_outputs.logits
+        hf_cache = hf_outputs.past_key_values
+
+        for step in range(decode_steps):
+            next_token = torch.argmax(hf_logits[:, -1, :], dim=-1, keepdim=True)
+            token_id = next_token.item()
+            token_text = tokenizer.decode_token(token_id)
+
+            our_logits, our_cache = ours_model(next_token, past_key_values=our_cache, use_cache=True)
+            hf_outputs = hf_model(input_ids=next_token, past_key_values=hf_cache, use_cache=True)
+            hf_logits = hf_outputs.logits
+            hf_cache = hf_outputs.past_key_values
+
+            diff = (our_logits.float() - hf_logits.float()).abs()
+            print(
+                "step",
+                step + 1,
+                "token",
+                token_id,
+                repr(token_text),
+                "max_abs_diff",
+                diff.max().item(),
+                "mean_abs_diff",
+                diff.mean().item(),
+                "next_token_match",
+                int(torch.argmax(our_logits[0, -1]).item() == torch.argmax(hf_logits[0, -1]).item()),
+            )
+
+
 def main() -> None:
     args = parse_args()
+    if args.decode_steps and not args.use_cache:
+        raise SystemExit("--decode-steps requires --use-cache.")
     if args.use_cache and (args.layerwise or args.blockwise):
         raise SystemExit("--use-cache currently supports headline logits only; layerwise/blockwise tracing remains no-cache only.")
 
@@ -498,6 +541,9 @@ def main() -> None:
     print("--- hf top tokens ---")
     for token_id, score, text in top_tokens(hf_logits, tokenizer, args.top_k):
         print(token_id, score, repr(text))
+
+    if args.decode_steps:
+        print_cached_decode_report(ours, hf, tokenizer, input_ids.to(args.device), args.decode_steps)
 
     if args.layerwise:
         with torch.inference_mode():
