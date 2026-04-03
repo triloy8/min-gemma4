@@ -480,8 +480,8 @@ def main() -> None:
             our_logits, _ = ours(input_ids.to(args.device), use_cache=True)
             hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=True).logits
         else:
-            our_logits = ours(input_ids.to(args.device))
-            hf_logits = hf(input_ids=input_ids.to(args.device)).logits
+            our_logits = ours(input_ids.to(args.device), use_cache=False)
+            hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=False).logits
 
     diff = (our_logits.float() - hf_logits.float()).abs()
     print("prompt")
