@@ -171,17 +171,35 @@ def collect_hf_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[s
         "embed": inputs_embeds.detach(),
         "per_layer_projected": projected_per_layer.detach(),
     }
-    # HF returns embeddings, each decoder layer output, and the final post-norm hidden state.
-    # We want layer_N to align with the raw decoder block output, and final_norm separately.
-    for idx, hidden in enumerate(outputs.hidden_states[1:-1]):
+
+    hidden_states = outputs.hidden_states
+    if hidden_states is None:
+        raise RuntimeError("HF model did not return hidden_states with output_hidden_states=True")
+
+    num_layers = lm.config.num_hidden_layers
+    # The tuple can vary depending on model wrappers, but the first entry is embeddings and the
+    # next `num_hidden_layers` entries should be raw decoder outputs.
+    if len(hidden_states) < num_layers + 1:
+        raise RuntimeError(
+            f"HF hidden_states too short: got {len(hidden_states)} entries for {num_layers} decoder layers"
+        )
+
+    for idx, hidden in enumerate(hidden_states[1 : 1 + num_layers]):
         out[f"layer_{idx}"] = hidden.detach()
-    out["final_norm"] = outputs.hidden_states[-1].detach()
+    out["final_norm"] = outputs.last_hidden_state.detach()
     out["logits"] = outputs.logits.detach()
     return out
 
 
 def print_layerwise_report(ours: dict[str, torch.Tensor], hf: dict[str, torch.Tensor]) -> None:
     print("--- layerwise ---")
+    our_layer_keys = {k for k in ours if k.startswith("layer_")}
+    hf_layer_keys = {k for k in hf if k.startswith("layer_")}
+    if our_layer_keys != hf_layer_keys:
+        missing_in_hf = sorted(our_layer_keys - hf_layer_keys, key=lambda key: int(key.split("_")[1]))
+        extra_in_hf = sorted(hf_layer_keys - our_layer_keys, key=lambda key: int(key.split("_")[1]))
+        raise RuntimeError(f"layer key mismatch: missing_in_hf={missing_in_hf} extra_in_hf={extra_in_hf}")
+
     tensor_stats("embed", ours["embed"], hf["embed"])
     tensor_stats("per_layer_projected", ours["per_layer_projected"], hf["per_layer_projected"])
 
