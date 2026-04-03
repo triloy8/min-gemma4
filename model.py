@@ -184,19 +184,109 @@ class Gemma4TextRotaryEmbedding(nn.Module):
 
 
 def build_causal_mask(seq_len: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    mask = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device, dtype=dtype)
-    mask = torch.triu(mask, diagonal=1)
-    return mask.unsqueeze(0).unsqueeze(0)
+    return build_attention_mask(
+        q_len=seq_len,
+        q_offset=0,
+        kv_len=seq_len,
+        kv_offset=0,
+        sliding_window=None,
+        device=device,
+        dtype=dtype,
+    )
 
 
 def build_sliding_causal_mask(seq_len: int, sliding_window: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
-    idx = torch.arange(seq_len, device=device)
-    q = idx[:, None]
-    k = idx[None, :]
-    allowed = (k <= q) & (k >= (q - sliding_window + 1))
-    mask = torch.full((seq_len, seq_len), torch.finfo(dtype).min, device=device, dtype=dtype)
+    return build_attention_mask(
+        q_len=seq_len,
+        q_offset=0,
+        kv_len=seq_len,
+        kv_offset=0,
+        sliding_window=sliding_window,
+        device=device,
+        dtype=dtype,
+    )
+
+
+def build_attention_mask(
+    q_len: int,
+    q_offset: int,
+    kv_len: int,
+    kv_offset: int,
+    sliding_window: int | None,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    q_idx = torch.arange(q_len, device=device) + q_offset
+    kv_idx = torch.arange(kv_len, device=device) + kv_offset
+    allowed = kv_idx[None, :] <= q_idx[:, None]
+    if sliding_window is not None:
+        allowed = allowed & (kv_idx[None, :] > (q_idx[:, None] - sliding_window))
+    mask = torch.full((q_len, kv_len), torch.finfo(dtype).min, device=device, dtype=dtype)
     mask = torch.where(allowed, torch.zeros((), device=device, dtype=dtype), mask)
     return mask.unsqueeze(0).unsqueeze(0)
+
+
+@dataclass
+class Gemma4LayerCache:
+    keys: torch.Tensor | None = None
+    values: torch.Tensor | None = None
+    seq_length: int = 0
+    sliding_window: int | None = None
+
+    def update(self, key_states: torch.Tensor, value_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.keys is None or self.values is None:
+            full_key_states = key_states
+            full_value_states = value_states
+        else:
+            full_key_states = torch.cat([self.keys, key_states], dim=-2)
+            full_value_states = torch.cat([self.values, value_states], dim=-2)
+
+        self.seq_length += key_states.shape[-2]
+        if self.sliding_window is None:
+            self.keys = full_key_states
+            self.values = full_value_states
+        else:
+            keep = max(self.sliding_window - 1, 0)
+            if keep == 0:
+                self.keys = full_key_states[:, :, :0, :]
+                self.values = full_value_states[:, :, :0, :]
+            else:
+                self.keys = full_key_states[:, :, -keep:, :]
+                self.values = full_value_states[:, :, -keep:, :]
+        return full_key_states, full_value_states
+
+
+class Gemma4Cache:
+    def __init__(self):
+        self.seq_length = 0
+        self.layers: dict[int, Gemma4LayerCache] = {}
+        self.shared_layers: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def get_seq_length(self) -> int:
+        return self.seq_length
+
+    def update(
+        self,
+        layer_idx: int,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        sliding_window: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        layer = self.layers.get(layer_idx)
+        if layer is None:
+            layer = Gemma4LayerCache(sliding_window=sliding_window)
+            self.layers[layer_idx] = layer
+        return layer.update(key_states, value_states)
+
+    def set_shared(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor) -> None:
+        self.shared_layers[layer_idx] = (key_states, value_states)
+
+    def get_shared(self, layer_idx: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key_states, value_states = self.shared_layers[layer_idx]
+        return key_states.to(device), value_states.to(device)
+
+    def advance(self, tokens: int) -> None:
+        self.seq_length += tokens
 
 
 class Gemma4TextMLP(nn.Module):
@@ -222,6 +312,15 @@ class Gemma4TextAttention(nn.Module):
         self.layer_type = config.layer_types[layer_idx]
         self.is_sliding = self.layer_type == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        prev_layers = config.layer_types[:first_kv_shared_layer_idx]
+        if self.is_kv_shared_layer:
+            self.kv_shared_layer_index = len(prev_layers) - 1 - prev_layers[::-1].index(self.layer_type)
+            self.store_full_length_kv = False
+        else:
+            self.kv_shared_layer_index = None
+            self.store_full_length_kv = layer_idx == len(prev_layers) - 1 - prev_layers[::-1].index(self.layer_type)
         self.head_dim = config.global_head_dim if not self.is_sliding and config.global_head_dim else config.head_dim
         num_key_value_heads = (
             config.num_global_key_value_heads if config.attention_k_eq_v and not self.is_sliding else config.num_key_value_heads
@@ -237,7 +336,13 @@ class Gemma4TextAttention(nn.Module):
         self.k_proj = nn.Linear(config.hidden_size, num_key_value_heads * self.head_dim, bias=config.attention_bias)
         self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias=config.attention_bias)
 
-    def forward(self, hidden_states: torch.Tensor, position_embeddings: tuple[torch.Tensor, torch.Tensor], attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor],
+        attention_mask: torch.Tensor,
+        past_key_values: Gemma4Cache | None = None,
+    ) -> torch.Tensor:
         batch, seq_len, _ = hidden_states.shape
         hidden_shape = (batch, seq_len, -1, self.head_dim)
         cos, sin = position_embeddings
@@ -246,12 +351,26 @@ class Gemma4TextAttention(nn.Module):
         query_states = self.q_norm(query_states)
         query_states = apply_rotary_pos_emb(query_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
 
-        key_states = self.k_proj(hidden_states).view(hidden_shape)
-        key_states = self.k_norm(key_states)
-        key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
+        if self.is_kv_shared_layer and past_key_values is not None:
+            key_states, value_states = past_key_values.get_shared(self.kv_shared_layer_index, query_states.device)
+        else:
+            key_states = self.k_proj(hidden_states).view(hidden_shape)
+            key_states = self.k_norm(key_states)
+            key_states = apply_rotary_pos_emb(key_states, cos, sin, unsqueeze_dim=2).transpose(1, 2)
 
-        value_states = self.v_proj(hidden_states).view(hidden_shape)
-        value_states = self.v_norm(value_states).transpose(1, 2)
+            value_states = self.v_proj(hidden_states).view(hidden_shape)
+            value_states = self.v_norm(value_states).transpose(1, 2)
+
+        if past_key_values is not None:
+            if not self.is_kv_shared_layer:
+                key_states, value_states = past_key_values.update(
+                    self.layer_idx,
+                    key_states,
+                    value_states,
+                    self.sliding_window,
+                )
+            if self.store_full_length_kv:
+                past_key_values.set_shared(self.layer_idx, key_states, value_states)
 
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
@@ -285,10 +404,11 @@ class Gemma4TextDecoderLayer(nn.Module):
         per_layer_input: torch.Tensor,
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor,
+        past_key_values: Gemma4Cache | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask)
+        hidden_states = self.self_attn(hidden_states, position_embeddings, attention_mask, past_key_values=past_key_values)
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -354,17 +474,50 @@ class Gemma4LanguageModel(nn.Module):
         per_layer_projection = self.per_layer_projection_norm(per_layer_projection)
         return (per_layer_projection + per_layer_inputs) * self.per_layer_input_scale
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Gemma4Cache | None = None,
+        use_cache: bool | None = None,
+    ) -> tuple[torch.Tensor, Gemma4Cache | None]:
+        use_cache = False if use_cache is None else use_cache
+        if use_cache and past_key_values is None:
+            past_key_values = Gemma4Cache()
+
         hidden_states = self.embed_tokens(input_ids)
         per_layer_inputs = self.get_per_layer_inputs(input_ids)
         per_layer_inputs = self.project_per_layer_inputs(hidden_states, per_layer_inputs)
 
         batch, seq_len = input_ids.shape
-        position_ids = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch, -1)
-        masks = {
-            "full_attention": build_causal_mask(seq_len, input_ids.device, hidden_states.dtype),
-            "sliding_attention": build_sliding_causal_mask(seq_len, self.config.sliding_window, input_ids.device, hidden_states.dtype),
-        }
+        past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+        position_ids = (torch.arange(seq_len, device=input_ids.device) + past_seen_tokens).unsqueeze(0).expand(batch, -1)
+        q_offset = past_seen_tokens
+        if past_key_values is None:
+            masks = {
+                "full_attention": build_causal_mask(seq_len, input_ids.device, hidden_states.dtype),
+                "sliding_attention": build_sliding_causal_mask(seq_len, self.config.sliding_window, input_ids.device, hidden_states.dtype),
+            }
+        else:
+            masks = {
+                "full_attention": build_attention_mask(
+                    q_len=seq_len,
+                    q_offset=q_offset,
+                    kv_len=past_seen_tokens + seq_len,
+                    kv_offset=0,
+                    sliding_window=None,
+                    device=input_ids.device,
+                    dtype=hidden_states.dtype,
+                ),
+                "sliding_attention": build_attention_mask(
+                    q_len=seq_len,
+                    q_offset=q_offset,
+                    kv_len=min(past_seen_tokens, self.config.sliding_window - 1) + seq_len,
+                    kv_offset=max(past_seen_tokens - self.config.sliding_window + 1, 0),
+                    sliding_window=self.config.sliding_window,
+                    device=input_ids.device,
+                    dtype=hidden_states.dtype,
+                ),
+            }
         position_embeddings = {
             layer_type: self.rotary_emb(hidden_states, position_ids, layer_type) for layer_type in set(self.config.layer_types)
         }
@@ -376,9 +529,13 @@ class Gemma4LanguageModel(nn.Module):
                 per_layer_input=per_layer_inputs[:, :, idx, :],
                 position_embeddings=position_embeddings[layer_type],
                 attention_mask=masks[layer_type],
+                past_key_values=past_key_values,
             )
 
-        return self.norm(hidden_states)
+        hidden_states = self.norm(hidden_states)
+        if past_key_values is not None:
+            past_key_values.advance(seq_len)
+        return hidden_states, past_key_values
 
 
 class Gemma4Model(nn.Module):
@@ -393,13 +550,24 @@ class Gemma4TextOnly(nn.Module):
         self.config = config
         self.model = Gemma4Model(config)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.model.language_model(input_ids)
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values: Gemma4Cache | None = None,
+        use_cache: bool | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, Gemma4Cache]:
+        hidden_states, past_key_values = self.model.language_model(
+            input_ids,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
         logits = F.linear(hidden_states, self.model.language_model.embed_tokens.weight)
         if self.config.final_logit_softcapping is not None:
             logits = logits / self.config.final_logit_softcapping
             logits = torch.tanh(logits)
             logits = logits * self.config.final_logit_softcapping
+        if use_cache:
+            return logits, past_key_values
         return logits
 
 

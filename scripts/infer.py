@@ -130,9 +130,12 @@ def generate(
     skip_special_tokens: bool,
 ) -> tuple[torch.Tensor, str]:
     generated = input_ids.to(device)
+    past_key_values = None
     with torch.no_grad():
-        for _ in range(max_new_tokens):
-            logits = model(generated)
+        logits, past_key_values = model(generated, use_cache=True)
+        for step in range(max_new_tokens):
+            if step > 0:
+                logits, past_key_values = model(next_token, past_key_values=past_key_values, use_cache=True)
             next_token = sample_next_token(logits, temperature=temperature, top_k=top_k)
             generated = torch.cat([generated, next_token], dim=1)
             if next_token.item() == tokenizer.eos_token_id:

@@ -62,6 +62,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cpu", help="Torch device for both models.")
     parser.add_argument("--dtype", choices=("bfloat16", "float16", "float32"), default="bfloat16")
     parser.add_argument("--loader", choices=("streamed", "naive"), default="naive")
+    parser.add_argument("--use-cache", action="store_true", help="Compare the cached decoding path instead of the no-cache prefill path.")
     parser.add_argument("--top-k", type=int, default=5, help="How many top tokens to print.")
     parser.add_argument("--layerwise", action="store_true", help="Also compare embeddings, projected per-layer inputs, and each decoder layer output.")
     parser.add_argument("--blockwise", action="store_true", help="Compare intermediate activations inside each decoder block.")
@@ -463,6 +464,9 @@ def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Mod
 
 def main() -> None:
     args = parse_args()
+    if args.use_cache and (args.layerwise or args.blockwise):
+        raise SystemExit("--use-cache currently supports headline logits only; layerwise/blockwise tracing remains no-cache only.")
+
     dtype = choose_dtype(args.dtype)
     tokenizer = LocalTokenizer()
     input_ids = tokenizer.encode_chat_prompt(args.prompt)
@@ -472,13 +476,18 @@ def main() -> None:
     hf = load_hf_model(device=args.device, dtype=dtype)
 
     with torch.inference_mode():
-        our_logits = ours(input_ids.to(args.device))
-        hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=False).logits
+        if args.use_cache:
+            our_logits, _ = ours(input_ids.to(args.device), use_cache=True)
+            hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=True).logits
+        else:
+            our_logits = ours(input_ids.to(args.device))
+            hf_logits = hf(input_ids=input_ids.to(args.device)).logits
 
     diff = (our_logits.float() - hf_logits.float()).abs()
     print("prompt")
     print(tokenizer.format_user_prompt(args.prompt))
     print("---")
+    print("use_cache", int(args.use_cache))
     print("shape", tuple(our_logits.shape), tuple(hf_logits.shape))
     print("max_abs_diff", diff.max().item())
     print("mean_abs_diff", diff.mean().item())
