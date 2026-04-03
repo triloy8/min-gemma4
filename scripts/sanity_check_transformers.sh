@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
 PROMPT="${PROMPT:-Hello.}"
-DEVICE="${DEVICE:-cpu}"
+DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
 LOADER="${LOADER:-naive}"
 TOP_K="${TOP_K:-5}"
