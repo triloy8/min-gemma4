@@ -145,6 +145,7 @@ def collect_ours_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict
         "per_layer_projected": projected_per_layer.detach(),
     }
 
+    num_layers = lm.config.num_hidden_layers
     for idx, layer in enumerate(lm.layers):
         layer_type = lm.config.layer_types[idx]
         hidden_states = layer(
@@ -153,7 +154,10 @@ def collect_ours_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict
             position_embeddings=position_embeddings[layer_type],
             attention_mask=masks[layer_type],
         )
-        out[f"layer_{idx}"] = hidden_states.detach()
+        # Keep layerwise reporting aligned with the hidden states that HF exposes directly:
+        # raw decoder outputs up to the penultimate layer, then final_norm separately.
+        if idx < num_layers - 1:
+            out[f"layer_{idx}"] = hidden_states.detach()
 
     out["final_norm"] = lm.norm(hidden_states).detach()
     out["logits"] = model(input_ids).detach()
@@ -187,16 +191,17 @@ def collect_hf_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[s
         raise RuntimeError("HF model did not return hidden_states with output_hidden_states=True")
 
     num_layers = lm.config.num_hidden_layers
-    # The tuple can vary depending on model wrappers, but the first entry is embeddings and the
-    # next `num_hidden_layers` entries should be raw decoder outputs.
-    if len(hidden_states) < num_layers + 1:
+    exposed_hidden_states = hidden_states[1:]
+    if len(exposed_hidden_states) < num_layers:
         raise RuntimeError(
             f"HF hidden_states too short: got {len(hidden_states)} entries for {num_layers} decoder layers"
         )
 
-    for idx, hidden in enumerate(hidden_states[1 : 1 + num_layers]):
+    # Empirically the last exposed hidden state corresponds to the final post-norm output,
+    # not a separate raw `layer_{num_layers - 1}` tensor.
+    for idx, hidden in enumerate(exposed_hidden_states[:-1]):
         out[f"layer_{idx}"] = hidden.detach()
-    out["final_norm"] = lm_outputs.last_hidden_state.detach()
+    out["final_norm"] = exposed_hidden_states[-1].detach()
     out["logits"] = logits_outputs.logits.detach()
     return out
 
