@@ -11,6 +11,7 @@ LOADER="${LOADER:-naive}"
 TOP_K="${TOP_K:-5}"
 LAYERWISE="${LAYERWISE:-1}"
 BLOCKWISE="${BLOCKWISE:-1}"
+USE_CACHE="${USE_CACHE:-0}"
 
 ARGS=(
   --prompt "$PROMPT"
@@ -26,6 +27,10 @@ fi
 
 if [[ "$BLOCKWISE" == "1" ]]; then
   ARGS+=(--blockwise)
+fi
+
+if [[ "$USE_CACHE" == "1" ]]; then
+  ARGS+=(--use-cache)
 fi
 
 exec uv run python scripts/sanity_check_transformers.py "${ARGS[@]}" "$@"
