@@ -165,14 +165,24 @@ def collect_hf_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[s
     inputs_embeds = lm.embed_tokens(input_ids)
     raw_per_layer = lm.get_per_layer_inputs(input_ids, inputs_embeds)
     projected_per_layer = lm.project_per_layer_inputs(inputs_embeds, raw_per_layer)
-    outputs = model(input_ids=input_ids, output_hidden_states=True, use_cache=False, return_dict=True)
+    lm_outputs = lm(
+        input_ids=input_ids,
+        output_hidden_states=True,
+        use_cache=False,
+        return_dict=True,
+    )
+    logits_outputs = model(
+        input_ids=input_ids,
+        use_cache=False,
+        return_dict=True,
+    )
 
     out: dict[str, torch.Tensor] = {
         "embed": inputs_embeds.detach(),
         "per_layer_projected": projected_per_layer.detach(),
     }
 
-    hidden_states = outputs.hidden_states
+    hidden_states = lm_outputs.hidden_states
     if hidden_states is None:
         raise RuntimeError("HF model did not return hidden_states with output_hidden_states=True")
 
@@ -186,8 +196,8 @@ def collect_hf_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[s
 
     for idx, hidden in enumerate(hidden_states[1 : 1 + num_layers]):
         out[f"layer_{idx}"] = hidden.detach()
-    out["final_norm"] = outputs.last_hidden_state.detach()
-    out["logits"] = outputs.logits.detach()
+    out["final_norm"] = lm_outputs.last_hidden_state.detach()
+    out["logits"] = logits_outputs.logits.detach()
     return out
 
 
