@@ -438,7 +438,7 @@ def main() -> None:
 
     with torch.inference_mode():
         our_logits = ours(input_ids.to(args.device))
-        hf_logits = hf(input_ids=input_ids.to(args.device)).logits
+        hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=False).logits
 
     diff = (our_logits.float() - hf_logits.float()).abs()
     print("prompt")
