@@ -171,7 +171,9 @@ def collect_hf_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[s
         "embed": inputs_embeds.detach(),
         "per_layer_projected": projected_per_layer.detach(),
     }
-    for idx, hidden in enumerate(outputs.hidden_states[1:]):
+    # HF returns embeddings, each decoder layer output, and the final post-norm hidden state.
+    # We want layer_N to align with the raw decoder block output, and final_norm separately.
+    for idx, hidden in enumerate(outputs.hidden_states[1:-1]):
         out[f"layer_{idx}"] = hidden.detach()
     out["final_norm"] = outputs.hidden_states[-1].detach()
     out["logits"] = outputs.logits.detach()
@@ -184,7 +186,7 @@ def print_layerwise_report(ours: dict[str, torch.Tensor], hf: dict[str, torch.Te
     tensor_stats("per_layer_projected", ours["per_layer_projected"], hf["per_layer_projected"])
 
     first_bad = None
-    layer_keys = sorted(k for k in ours if k.startswith("layer_"))
+    layer_keys = sorted((k for k in ours if k.startswith("layer_")), key=lambda key: int(key.split("_")[1]))
     for key in layer_keys:
         diff = (ours[key].float() - hf[key].float()).abs()
         max_diff = diff.max().item()
