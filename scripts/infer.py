@@ -13,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from model import Gemma4TextConfig, build_model, build_model_naive, list_text_keys, validate_text_checkpoint
+from model import Gemma4Config, build_model, build_model_naive, list_text_keys, prepare_image_inputs, validate_text_checkpoint
 
 
 TOKENIZER_PATH = ROOT / "config" / "tokenizer.json"
@@ -21,9 +21,10 @@ TOKENIZER_CONFIG_PATH = ROOT / "config" / "tokenizer_config.json"
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Minimal text-only Gemma 4 inference entrypoint.")
+    parser = argparse.ArgumentParser(description="Minimal Gemma 4 inference entrypoint.")
     parser.add_argument("--prompt", help="User message to send through the chat template.")
     parser.add_argument("--prompt-file", help="Read the user prompt from a file.")
+    parser.add_argument("--image", help="Optional image path for image-first multimodal prompting.")
     parser.add_argument("--max-new-tokens", type=int, default=32, help="Number of tokens to generate.")
     parser.add_argument("--temperature", type=float, default=0.0, help="0.0 means greedy decoding.")
     parser.add_argument("--top-k", type=int, default=0, help="Optional top-k sampling cutoff.")
@@ -84,9 +85,24 @@ class LocalTokenizer:
         self.eos_token = self.config["eos_token"]
         self.sot_token = self.config["sot_token"]
         self.eot_token = self.config["eot_token"]
+        self.image_token = self.config["image_token"]
+        self.boi_token = self.config["boi_token"]
+        self.eoi_token = self.config["eoi_token"]
         self.eos_token_id = self.backend.token_to_id(self.eos_token)
 
-    def format_user_prompt(self, prompt: str) -> str:
+    def _expand_image_prompt(self, prompt: str, num_image_tokens: int | None) -> str:
+        if num_image_tokens is None:
+            return prompt.rstrip()
+        prompt = prompt.rstrip()
+        if self.image_token not in prompt:
+            prompt = f"{self.image_token}\n{prompt}"
+        if prompt.count(self.image_token) != 1:
+            raise ValueError("only one image placeholder is currently supported")
+        replacement = f"{self.boi_token}{self.image_token * num_image_tokens}{self.eoi_token}"
+        return prompt.replace(self.image_token, replacement, 1)
+
+    def format_user_prompt(self, prompt: str, num_image_tokens: int | None = None) -> str:
+        prompt = self._expand_image_prompt(prompt, num_image_tokens)
         prompt = prompt.rstrip()
         return (
             f"{self.bos_token}"
@@ -96,8 +112,8 @@ class LocalTokenizer:
             f"{self.sot_token}model\n"
         )
 
-    def encode_chat_prompt(self, prompt: str) -> torch.Tensor:
-        formatted = self.format_user_prompt(prompt)
+    def encode_chat_prompt(self, prompt: str, num_image_tokens: int | None = None) -> torch.Tensor:
+        formatted = self.format_user_prompt(prompt, num_image_tokens=num_image_tokens)
         encoding = self.backend.encode(formatted)
         return torch.tensor([encoding.ids], dtype=torch.long)
 
@@ -128,11 +144,18 @@ def generate(
     top_k: int,
     device: str,
     skip_special_tokens: bool,
+    pixel_values: torch.Tensor | None = None,
+    image_position_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, str]:
     generated = input_ids.to(device)
     past_key_values = None
     with torch.no_grad():
-        logits, past_key_values = model(generated, use_cache=True)
+        logits, past_key_values = model(
+            generated,
+            pixel_values=pixel_values,
+            image_position_ids=image_position_ids,
+            use_cache=True,
+        )
         for step in range(max_new_tokens):
             if step > 0:
                 logits, past_key_values = model(next_token, past_key_values=past_key_values, use_cache=True)
@@ -154,14 +177,20 @@ def resolve_prompt(args: argparse.Namespace) -> str:
 
 def main() -> None:
     args = parse_args()
-    config = Gemma4TextConfig.from_file()
+    config = Gemma4Config.from_file()
     prompt = resolve_prompt(args)
+    image_inputs = None
+    num_image_tokens = None
+
+    if args.image:
+        pixel_values, image_position_ids, num_image_tokens = prepare_image_inputs(args.image)
+        image_inputs = (pixel_values, image_position_ids)
 
     if not args.skip_validate or args.validate_only:
         keys = list_text_keys()
         expected, available = validate_text_checkpoint()
         print("validated")
-        print("text_layers", config.num_hidden_layers)
+        print("text_layers", config.text_config.num_hidden_layers)
         print("text_tensors", len(keys))
         print("expected", expected)
         print("available", available)
@@ -169,8 +198,8 @@ def main() -> None:
             return
 
     tokenizer = LocalTokenizer()
-    formatted_prompt = tokenizer.format_user_prompt(prompt)
-    input_ids = tokenizer.encode_chat_prompt(prompt)
+    formatted_prompt = tokenizer.format_user_prompt(prompt, num_image_tokens=num_image_tokens)
+    input_ids = tokenizer.encode_chat_prompt(prompt, num_image_tokens=num_image_tokens)
 
     if args.show_prompt:
         print("--- prompt ---")
@@ -178,12 +207,18 @@ def main() -> None:
         print("--------------")
 
     builder = build_model if args.loader == "streamed" else build_model_naive
-    model = builder(device=args.device, dtype=choose_dtype(args.dtype))
+    model = builder(device=args.device, dtype=choose_dtype(args.dtype), include_vision=bool(args.image))
 
     if args.temperature > 0.0:
         torch.manual_seed(args.seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(args.seed)
+
+    generate_kwargs = {}
+    if image_inputs is not None:
+        pixel_values, image_position_ids = image_inputs
+        generate_kwargs["pixel_values"] = pixel_values.to(device=args.device, dtype=choose_dtype(args.dtype))
+        generate_kwargs["image_position_ids"] = image_position_ids.to(device=args.device)
 
     generated_ids, generated_text = generate(
         model=model,
@@ -194,6 +229,7 @@ def main() -> None:
         top_k=args.top_k,
         device=args.device,
         skip_special_tokens=args.skip_special_tokens,
+        **generate_kwargs,
     )
 
     print("loader", args.loader)
