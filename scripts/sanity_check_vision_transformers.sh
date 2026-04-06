@@ -6,7 +6,7 @@ cd "$ROOT_DIR"
 
 IMAGE="${IMAGE:-}"
 PROMPT="${PROMPT:-Describe the image briefly.}"
-DEVICE="${DEVICE:-cpu}"
+DEVICE="${DEVICE:-cuda}"
 DTYPE="${DTYPE:-bfloat16}"
 LOADER="${LOADER:-naive}"
 TOP_K="${TOP_K:-5}"
