@@ -126,6 +126,23 @@ def tensor_stats(name: str, ours: torch.Tensor, hf: torch.Tensor) -> None:
     print(name, "shape", tuple(ours.shape), "max_abs_diff", diff.max().item(), "mean_abs_diff", diff.mean().item())
 
 
+def to_cpu_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: to_cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(to_cpu_tree(item) for item in value)
+    if isinstance(value, list):
+        return [to_cpu_tree(item) for item in value]
+    return value
+
+
+def release_cuda_memory() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def collect_ours_stages(model: torch.nn.Module, input_ids: torch.Tensor) -> dict[str, torch.Tensor]:
     lm = model.model.language_model
     hidden_states = lm.embed_tokens(input_ids)
@@ -252,30 +269,14 @@ def build_common_context(lm: torch.nn.Module, input_ids: torch.Tensor) -> tuple[
     return hidden_states, position_ids, masks, position_embeddings
 
 
-def run_prefix_layers(
+def run_prefix_layers_ours(
     ours_model: torch.nn.Module,
-    hf_model: torch.nn.Module,
     input_ids: torch.Tensor,
     stop_before_layer: int,
-) -> tuple[
-    torch.Tensor,
-    torch.Tensor,
-    dict[str, torch.Tensor],
-    dict[str, tuple[torch.Tensor, torch.Tensor]],
-    dict[str, torch.Tensor],
-    dict[str, tuple[torch.Tensor, torch.Tensor]],
-    torch.Tensor,
-    torch.Tensor,
-]:
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
     ours_lm = ours_model.model.language_model
-    hf_lm = hf_model.model
-
     ours_hidden, _, ours_masks, ours_pos = build_common_context(ours_lm, input_ids)
-    hf_hidden, _, hf_masks, hf_pos = build_common_context(hf_lm, input_ids)
-
     ours_per_layer = ours_lm.project_per_layer_inputs(ours_hidden, ours_lm.get_per_layer_inputs(input_ids))
-    hf_per_layer = hf_lm.project_per_layer_inputs(hf_hidden, hf_lm.get_per_layer_inputs(input_ids, hf_hidden))
-
     for idx in range(stop_before_layer):
         layer_type = ours_lm.config.layer_types[idx]
         ours_hidden = ours_lm.layers[idx](
@@ -284,6 +285,19 @@ def run_prefix_layers(
             position_embeddings=ours_pos[layer_type],
             attention_mask=ours_masks[layer_type],
         )
+    return ours_hidden, ours_masks, ours_pos, ours_per_layer
+
+
+def run_prefix_layers_hf(
+    hf_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    stop_before_layer: int,
+) -> tuple[torch.Tensor, dict[str, torch.Tensor], dict[str, tuple[torch.Tensor, torch.Tensor]], torch.Tensor]:
+    hf_lm = hf_model.model
+    hf_hidden, _, hf_masks, hf_pos = build_common_context(hf_lm, input_ids)
+    hf_per_layer = hf_lm.project_per_layer_inputs(hf_hidden, hf_lm.get_per_layer_inputs(input_ids, hf_hidden))
+    for idx in range(stop_before_layer):
+        layer_type = hf_lm.config.layer_types[idx]
         hf_hidden = hf_lm.layers[idx](
             hf_hidden,
             hf_per_layer[:, :, idx, :],
@@ -292,36 +306,72 @@ def run_prefix_layers(
             position_ids=None,
             past_key_values=None,
         )
+    return hf_hidden, hf_masks, hf_pos, hf_per_layer
 
-    return ours_hidden, hf_hidden, ours_masks, ours_pos, hf_masks, hf_pos, ours_per_layer, hf_per_layer
 
-
-def collect_block_activations(
+def collect_block_activations_ours(
     ours_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    layer_idx: int,
+) -> dict[str, torch.Tensor]:
+    ours_lm = ours_model.model.language_model
+    ours_hidden, ours_masks, ours_pos, ours_per_layer = run_prefix_layers_ours(ours_model, input_ids, stop_before_layer=layer_idx)
+    layer_type = ours_lm.config.layer_types[layer_idx]
+    ours_layer = ours_lm.layers[layer_idx]
+    ours_pli = ours_per_layer[:, :, layer_idx, :]
+
+    ours_residual_0 = ours_hidden
+    ours_input_ln = ours_layer.input_layernorm(ours_hidden)
+    ours_attn = ours_layer.self_attn(ours_input_ln, ours_pos[layer_type], ours_masks[layer_type])
+    ours_post_attn_ln = ours_layer.post_attention_layernorm(ours_attn)
+    ours_after_attn = ours_residual_0 + ours_post_attn_ln
+    ours_residual_1 = ours_after_attn
+    ours_pre_ffn_ln = ours_layer.pre_feedforward_layernorm(ours_after_attn)
+    ours_mlp = ours_layer.mlp(ours_pre_ffn_ln)
+    ours_post_ffn_ln = ours_layer.post_feedforward_layernorm(ours_mlp)
+    ours_after_ffn = ours_residual_1 + ours_post_ffn_ln
+    ours_residual_2 = ours_after_ffn
+    ours_pli_gate = ours_layer.per_layer_input_gate(ours_after_ffn)
+    ours_pli_act = ours_layer.act_fn(ours_pli_gate)
+    ours_pli_mul = ours_pli_act * ours_pli
+    ours_pli_proj = ours_layer.per_layer_projection(ours_pli_mul)
+    ours_post_pli_ln = ours_layer.post_per_layer_input_norm(ours_pli_proj)
+    ours_after_pli = ours_residual_2 + ours_post_pli_ln
+    ours_final = ours_after_pli * ours_layer.layer_scalar
+
+    return {
+        "residual_in": ours_residual_0,
+        "input_ln": ours_input_ln,
+        "attn": ours_attn,
+        "post_attn_ln": ours_post_attn_ln,
+        "after_attn": ours_after_attn,
+        "pre_ffn_ln": ours_pre_ffn_ln,
+        "mlp": ours_mlp,
+        "post_ffn_ln": ours_post_ffn_ln,
+        "after_ffn": ours_after_ffn,
+        "pli_gate": ours_pli_gate,
+        "pli_act": ours_pli_act,
+        "pli_mul": ours_pli_mul,
+        "pli_proj": ours_pli_proj,
+        "post_pli_ln": ours_post_pli_ln,
+        "after_pli": ours_after_pli,
+        "final": ours_final,
+    }
+
+
+def collect_block_activations_hf(
     hf_model: torch.nn.Module,
     input_ids: torch.Tensor,
     layer_idx: int,
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
-    ours_lm = ours_model.model.language_model
+) -> dict[str, torch.Tensor]:
     hf_lm = hf_model.model
-
-    ours_hidden, hf_hidden, ours_masks, ours_pos, hf_masks, hf_pos, ours_per_layer, hf_per_layer = run_prefix_layers(
-        ours_model, hf_model, input_ids, stop_before_layer=layer_idx
-    )
-
-    layer_type = ours_lm.config.layer_types[layer_idx]
-    ours_layer = ours_lm.layers[layer_idx]
+    hf_hidden, hf_masks, hf_pos, hf_per_layer = run_prefix_layers_hf(hf_model, input_ids, stop_before_layer=layer_idx)
+    layer_type = hf_lm.config.layer_types[layer_idx]
     hf_layer = hf_lm.layers[layer_idx]
-    ours_pli = ours_per_layer[:, :, layer_idx, :]
     hf_pli = hf_per_layer[:, :, layer_idx, :]
 
-    ours_residual_0 = ours_hidden
     hf_residual_0 = hf_hidden
-
-    ours_input_ln = ours_layer.input_layernorm(ours_hidden)
     hf_input_ln = hf_layer.input_layernorm(hf_hidden)
-
-    ours_attn = ours_layer.self_attn(ours_input_ln, ours_pos[layer_type], ours_masks[layer_type])
     hf_attn, _ = hf_layer.self_attn(
         hidden_states=hf_input_ln,
         position_embeddings=hf_pos[layer_type],
@@ -329,92 +379,63 @@ def collect_block_activations(
         position_ids=None,
         past_key_values=None,
     )
-
-    ours_post_attn_ln = ours_layer.post_attention_layernorm(ours_attn)
     hf_post_attn_ln = hf_layer.post_attention_layernorm(hf_attn)
-
-    ours_after_attn = ours_residual_0 + ours_post_attn_ln
     hf_after_attn = hf_residual_0 + hf_post_attn_ln
-
-    ours_residual_1 = ours_after_attn
     hf_residual_1 = hf_after_attn
-
-    ours_pre_ffn_ln = ours_layer.pre_feedforward_layernorm(ours_after_attn)
     hf_pre_ffn_ln = hf_layer.pre_feedforward_layernorm(hf_after_attn)
-
-    ours_mlp = ours_layer.mlp(ours_pre_ffn_ln)
     hf_mlp = hf_layer.mlp(hf_pre_ffn_ln)
-
-    ours_post_ffn_ln = ours_layer.post_feedforward_layernorm(ours_mlp)
     hf_post_ffn_ln = hf_layer.post_feedforward_layernorm(hf_mlp)
-
-    ours_after_ffn = ours_residual_1 + ours_post_ffn_ln
     hf_after_ffn = hf_residual_1 + hf_post_ffn_ln
-
-    ours_residual_2 = ours_after_ffn
     hf_residual_2 = hf_after_ffn
-
-    ours_pli_gate = ours_layer.per_layer_input_gate(ours_after_ffn)
     hf_pli_gate = hf_layer.per_layer_input_gate(hf_after_ffn)
-
-    ours_pli_act = ours_layer.act_fn(ours_pli_gate)
     hf_pli_act = hf_layer.act_fn(hf_pli_gate)
-
-    ours_pli_mul = ours_pli_act * ours_pli
     hf_pli_mul = hf_pli_act * hf_pli
-
-    ours_pli_proj = ours_layer.per_layer_projection(ours_pli_mul)
     hf_pli_proj = hf_layer.per_layer_projection(hf_pli_mul)
-
-    ours_post_pli_ln = ours_layer.post_per_layer_input_norm(ours_pli_proj)
     hf_post_pli_ln = hf_layer.post_per_layer_input_norm(hf_pli_proj)
-
-    ours_after_pli = ours_residual_2 + ours_post_pli_ln
     hf_after_pli = hf_residual_2 + hf_post_pli_ln
-
-    ours_final = ours_after_pli * ours_layer.layer_scalar
     hf_final = hf_after_pli * hf_layer.layer_scalar
 
     return {
-        "residual_in": (ours_residual_0, hf_residual_0),
-        "input_ln": (ours_input_ln, hf_input_ln),
-        "attn": (ours_attn, hf_attn),
-        "post_attn_ln": (ours_post_attn_ln, hf_post_attn_ln),
-        "after_attn": (ours_after_attn, hf_after_attn),
-        "pre_ffn_ln": (ours_pre_ffn_ln, hf_pre_ffn_ln),
-        "mlp": (ours_mlp, hf_mlp),
-        "post_ffn_ln": (ours_post_ffn_ln, hf_post_ffn_ln),
-        "after_ffn": (ours_after_ffn, hf_after_ffn),
-        "pli_gate": (ours_pli_gate, hf_pli_gate),
-        "pli_act": (ours_pli_act, hf_pli_act),
-        "pli_mul": (ours_pli_mul, hf_pli_mul),
-        "pli_proj": (ours_pli_proj, hf_pli_proj),
-        "post_pli_ln": (ours_post_pli_ln, hf_post_pli_ln),
-        "after_pli": (ours_after_pli, hf_after_pli),
-        "final": (ours_final, hf_final),
+        "residual_in": hf_residual_0,
+        "input_ln": hf_input_ln,
+        "attn": hf_attn,
+        "post_attn_ln": hf_post_attn_ln,
+        "after_attn": hf_after_attn,
+        "pre_ffn_ln": hf_pre_ffn_ln,
+        "mlp": hf_mlp,
+        "post_ffn_ln": hf_post_ffn_ln,
+        "after_ffn": hf_after_ffn,
+        "pli_gate": hf_pli_gate,
+        "pli_act": hf_pli_act,
+        "pli_mul": hf_pli_mul,
+        "pli_proj": hf_pli_proj,
+        "post_pli_ln": hf_post_pli_ln,
+        "after_pli": hf_after_pli,
+        "final": hf_final,
     }
 
 
 def print_block_activations(
-    ours_model: torch.nn.Module,
-    hf_model: torch.nn.Module,
-    input_ids: torch.Tensor,
+    ours_activations: dict[str, torch.Tensor],
+    hf_activations: dict[str, torch.Tensor],
     layer_idx: int,
 ) -> None:
-    activations = collect_block_activations(ours_model, hf_model, input_ids, layer_idx)
     print(f"--- layer_{layer_idx} block ---")
-    for name, (ours, hf) in activations.items():
-        tensor_stats(f"layer_{layer_idx}_{name}", ours, hf)
+    for name in ours_activations:
+        tensor_stats(f"layer_{layer_idx}_{name}", ours_activations[name], hf_activations[name])
 
 
 def print_blockwise_report(
-    ours_model: torch.nn.Module,
-    hf_model: torch.nn.Module,
-    input_ids: torch.Tensor,
+    ours_activations_by_layer: dict[int, dict[str, torch.Tensor]],
+    hf_activations_by_layer: dict[int, dict[str, torch.Tensor]],
     layer_start: int | None = None,
     layer_end: int | None = None,
 ) -> None:
-    num_layers = ours_model.model.language_model.config.num_hidden_layers
+    layer_indices = sorted(ours_activations_by_layer)
+    if not layer_indices:
+        raise ValueError("no block activations collected")
+
+    num_layers = max(layer_indices) + 1
     start = 0 if layer_start is None else max(0, layer_start)
     end = num_layers - 1 if layer_end is None else min(num_layers - 1, layer_end)
 
@@ -423,15 +444,56 @@ def print_blockwise_report(
 
     print("--- blockwise ---")
     for layer_idx in range(start, end + 1):
-        print_block_activations(ours_model, hf_model, input_ids, layer_idx)
+        print_block_activations(ours_activations_by_layer[layer_idx], hf_activations_by_layer[layer_idx], layer_idx)
 
 
-def compare_rope_tensors(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
+def collect_blockwise_range_ours(
+    ours_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    layer_start: int | None = None,
+    layer_end: int | None = None,
+) -> dict[int, dict[str, torch.Tensor]]:
+    num_layers = ours_model.model.language_model.config.num_hidden_layers
+    start = 0 if layer_start is None else max(0, layer_start)
+    end = num_layers - 1 if layer_end is None else min(num_layers - 1, layer_end)
+    if start > end:
+        raise ValueError(f"invalid blockwise range: start={start} end={end}")
+    return {
+        layer_idx: to_cpu_tree(collect_block_activations_ours(ours_model, input_ids, layer_idx))
+        for layer_idx in range(start, end + 1)
+    }
+
+
+def collect_blockwise_range_hf(
+    hf_model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    layer_start: int | None = None,
+    layer_end: int | None = None,
+) -> dict[int, dict[str, torch.Tensor]]:
+    num_layers = hf_model.model.config.num_hidden_layers
+    start = 0 if layer_start is None else max(0, layer_start)
+    end = num_layers - 1 if layer_end is None else min(num_layers - 1, layer_end)
+    if start > end:
+        raise ValueError(f"invalid blockwise range: start={start} end={end}")
+    return {
+        layer_idx: to_cpu_tree(collect_block_activations_hf(hf_model, input_ids, layer_idx))
+        for layer_idx in range(start, end + 1)
+    }
+
+
+def collect_rope_tensors_ours(ours_model: torch.nn.Module, input_ids: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     ours_lm = ours_model.model.language_model
-    hf_lm = hf_model.model
     _, _, _, ours_pos = build_common_context(ours_lm, input_ids)
-    _, _, _, hf_pos = build_common_context(hf_lm, input_ids)
+    return ours_pos
 
+
+def collect_rope_tensors_hf(hf_model: torch.nn.Module, input_ids: torch.Tensor) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+    hf_lm = hf_model.model
+    _, _, _, hf_pos = build_common_context(hf_lm, input_ids)
+    return hf_pos
+
+
+def compare_rope_tensors(ours_pos: dict[str, tuple[torch.Tensor, torch.Tensor]], hf_pos: dict[str, tuple[torch.Tensor, torch.Tensor]]) -> None:
     print("--- rope ---")
     for layer_type in sorted(ours_pos):
         ours_cos, ours_sin = ours_pos[layer_type]
@@ -440,27 +502,21 @@ def compare_rope_tensors(ours_model: torch.nn.Module, hf_model: torch.nn.Module,
         tensor_stats(f"{layer_type}_sin", ours_sin, hf_sin)
 
 
-def compare_last_layer_attention(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
-    ours_lm = ours_model.model.language_model
-    hf_lm = hf_model.model
-
-    last_idx = ours_lm.config.num_hidden_layers - 1
-    activations = collect_block_activations(ours_model, hf_model, input_ids, last_idx)
-    ours_normed, hf_normed = activations["input_ln"]
-    ours_attn, hf_attn = activations["attn"]
+def compare_last_layer_attention(ours_activations: dict[str, torch.Tensor], hf_activations: dict[str, torch.Tensor], last_idx: int) -> None:
+    ours_normed = ours_activations["input_ln"]
+    hf_normed = hf_activations["input_ln"]
+    ours_attn = ours_activations["attn"]
+    hf_attn = hf_activations["attn"]
 
     print("--- last layer attention ---")
-    tensor_stats("layer_41_input_normed", ours_normed, hf_normed)
-    tensor_stats("layer_41_attn_output", ours_attn, hf_attn)
+    tensor_stats(f"layer_{last_idx}_input_normed", ours_normed, hf_normed)
+    tensor_stats(f"layer_{last_idx}_attn_output", ours_attn, hf_attn)
 
 
-def compare_last_layer_block(ours_model: torch.nn.Module, hf_model: torch.nn.Module, input_ids: torch.Tensor) -> None:
-    last_idx = ours_model.model.language_model.config.num_hidden_layers - 1
-    activations = collect_block_activations(ours_model, hf_model, input_ids, last_idx)
-
+def compare_last_layer_block(ours_activations: dict[str, torch.Tensor], hf_activations: dict[str, torch.Tensor], last_idx: int) -> None:
     print("--- last layer block ---")
-    for name, (ours, hf) in activations.items():
-        tensor_stats(f"layer_41_{name}", ours, hf)
+    for name in ours_activations:
+        tensor_stats(f"layer_{last_idx}_{name}", ours_activations[name], hf_activations[name])
 
 
 def print_cached_decode_report(
@@ -472,28 +528,91 @@ def print_cached_decode_report(
 ) -> None:
     print("--- cached decode ---")
     with torch.inference_mode():
-        our_logits, our_cache = ours_model(input_ids, use_cache=True)
         hf_outputs = hf_model(input_ids=input_ids, use_cache=True)
-        hf_logits = hf_outputs.logits
         hf_cache = hf_outputs.past_key_values
+        hf_steps = []
 
         for step in range(decode_steps):
-            next_token = torch.argmax(hf_logits[:, -1, :], dim=-1, keepdim=True)
+            next_token = torch.argmax(hf_outputs.logits[:, -1, :], dim=-1, keepdim=True)
             token_id = next_token.item()
             token_text = tokenizer.decode_token(token_id)
-
-            our_logits, our_cache = ours_model(next_token, past_key_values=our_cache, use_cache=True)
             hf_outputs = hf_model(input_ids=next_token, past_key_values=hf_cache, use_cache=True)
-            hf_logits = hf_outputs.logits
             hf_cache = hf_outputs.past_key_values
+            hf_steps.append(
+                {
+                    "token_id": token_id,
+                    "token_text": token_text,
+                    "hf_logits": hf_outputs.logits.detach().cpu(),
+                }
+            )
 
-            diff = (our_logits.float() - hf_logits.float()).abs()
+        our_logits, our_cache = ours_model(input_ids, use_cache=True)
+        for step, hf_step in enumerate(hf_steps, start=1):
+            next_token = torch.tensor([[hf_step["token_id"]]], device=input_ids.device, dtype=torch.long)
+            our_logits, our_cache = ours_model(next_token, past_key_values=our_cache, use_cache=True)
+            hf_logits = hf_step["hf_logits"]
+            diff = (our_logits.detach().cpu().float() - hf_logits.float()).abs()
+
             print(
                 "step",
-                step + 1,
+                step,
                 "token",
-                token_id,
-                repr(token_text),
+                hf_step["token_id"],
+                repr(hf_step["token_text"]),
+                "max_abs_diff",
+                diff.max().item(),
+                "mean_abs_diff",
+                diff.mean().item(),
+                "next_token_match", int(torch.argmax(our_logits[0, -1]).item() == torch.argmax(hf_logits[0, -1]).item()),
+            )
+
+
+def collect_hf_cached_decode_steps(
+    hf_model: torch.nn.Module,
+    tokenizer: LocalTokenizer,
+    input_ids: torch.Tensor,
+    decode_steps: int,
+) -> list[dict[str, object]]:
+    steps: list[dict[str, object]] = []
+    with torch.inference_mode():
+        hf_outputs = hf_model(input_ids=input_ids, use_cache=True)
+        hf_cache = hf_outputs.past_key_values
+        for _ in range(decode_steps):
+            next_token = torch.argmax(hf_outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            token_id = next_token.item()
+            hf_outputs = hf_model(input_ids=next_token, past_key_values=hf_cache, use_cache=True)
+            hf_cache = hf_outputs.past_key_values
+            steps.append(
+                {
+                    "token_id": token_id,
+                    "token_text": tokenizer.decode_token(token_id),
+                    "hf_logits": hf_outputs.logits.detach().cpu(),
+                }
+            )
+    return steps
+
+
+def print_cached_decode_report_from_steps(
+    ours_model: torch.nn.Module,
+    tokenizer: LocalTokenizer,
+    input_ids: torch.Tensor,
+    hf_steps: list[dict[str, object]],
+) -> None:
+    print("--- cached decode ---")
+    with torch.inference_mode():
+        _, our_cache = ours_model(input_ids, use_cache=True)
+        for step, hf_step in enumerate(hf_steps, start=1):
+            next_token = torch.tensor([[hf_step["token_id"]]], device=input_ids.device, dtype=torch.long)
+            our_logits, our_cache = ours_model(next_token, past_key_values=our_cache, use_cache=True)
+            hf_logits = hf_step["hf_logits"]
+            diff = (our_logits.detach().cpu().float() - hf_logits.float()).abs()
+
+            print(
+                "step",
+                step,
+                "token",
+                hf_step["token_id"],
+                repr(hf_step["token_text"]),
                 "max_abs_diff",
                 diff.max().item(),
                 "mean_abs_diff",
@@ -513,56 +632,114 @@ def main() -> None:
     dtype = choose_dtype(args.dtype)
     tokenizer = LocalTokenizer()
     input_ids = tokenizer.encode_chat_prompt(args.prompt)
+    input_ids_device = input_ids.to(args.device)
 
     builder = build_model if args.loader == "streamed" else build_model_naive
-    ours = builder(device=args.device, dtype=dtype)
-    hf = load_hf_model(device=args.device, dtype=dtype)
 
+    ours_logits = None
+    ours_stages = None
+    ours_rope = None
+    ours_last_layer = None
+    hf_logits = None
+    hf_stages = None
+    hf_rope = None
+    hf_last_layer = None
+    hf_decode_steps = None
+
+    ours = builder(device=args.device, dtype=dtype)
     with torch.inference_mode():
         if args.use_cache:
-            our_logits, _ = ours(input_ids.to(args.device), use_cache=True)
-            hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=True).logits
+            ours_logits, _ = ours(input_ids_device, use_cache=True)
         else:
-            our_logits = ours(input_ids.to(args.device), use_cache=False)
-            hf_logits = hf(input_ids=input_ids.to(args.device), use_cache=False).logits
+            ours_logits = ours(input_ids_device, use_cache=False)
+        ours_logits = ours_logits.detach().cpu()
 
-    diff = (our_logits.float() - hf_logits.float()).abs()
+        if args.layerwise:
+            ours_stages = to_cpu_tree(collect_ours_stages(ours, input_ids_device))
+            ours_rope = to_cpu_tree(collect_rope_tensors_ours(ours, input_ids_device))
+            last_idx = ours.model.language_model.config.num_hidden_layers - 1
+            ours_last_layer = to_cpu_tree(collect_block_activations_ours(ours, input_ids_device, last_idx))
+    del ours
+    release_cuda_memory()
+
+    hf = load_hf_model(device=args.device, dtype=dtype)
+    with torch.inference_mode():
+        if args.use_cache:
+            hf_logits = hf(input_ids=input_ids_device, use_cache=True).logits
+            if args.decode_steps:
+                hf_decode_steps = collect_hf_cached_decode_steps(hf, tokenizer, input_ids_device, args.decode_steps)
+        else:
+            hf_logits = hf(input_ids=input_ids_device, use_cache=False).logits
+        hf_logits = hf_logits.detach().cpu()
+
+        if args.layerwise:
+            hf_stages = to_cpu_tree(collect_hf_stages(hf, input_ids_device))
+            hf_rope = to_cpu_tree(collect_rope_tensors_hf(hf, input_ids_device))
+            last_idx = hf.model.config.num_hidden_layers - 1
+            hf_last_layer = to_cpu_tree(collect_block_activations_hf(hf, input_ids_device, last_idx))
+
+    diff = (ours_logits.float() - hf_logits.float()).abs()
     print("prompt")
     print(tokenizer.format_user_prompt(args.prompt))
     print("---")
     print("use_cache", int(args.use_cache))
-    print("shape", tuple(our_logits.shape), tuple(hf_logits.shape))
+    print("shape", tuple(ours_logits.shape), tuple(hf_logits.shape))
     print("max_abs_diff", diff.max().item())
     print("mean_abs_diff", diff.mean().item())
-    print("next_token_match", int(torch.argmax(our_logits[0, -1]).item() == torch.argmax(hf_logits[0, -1]).item()))
+    print("next_token_match", int(torch.argmax(ours_logits[0, -1]).item() == torch.argmax(hf_logits[0, -1]).item()))
     print("--- ours top tokens ---")
-    for token_id, score, text in top_tokens(our_logits, tokenizer, args.top_k):
+    for token_id, score, text in top_tokens(ours_logits, tokenizer, args.top_k):
         print(token_id, score, repr(text))
     print("--- hf top tokens ---")
     for token_id, score, text in top_tokens(hf_logits, tokenizer, args.top_k):
         print(token_id, score, repr(text))
 
     if args.decode_steps:
-        print_cached_decode_report(ours, hf, tokenizer, input_ids.to(args.device), args.decode_steps)
+        del hf
+        release_cuda_memory()
+        ours = builder(device=args.device, dtype=dtype)
+        print_cached_decode_report_from_steps(ours, tokenizer, input_ids_device, hf_decode_steps or [])
+        del ours
+        release_cuda_memory()
+    else:
+        del hf
+        release_cuda_memory()
 
     if args.layerwise:
-        with torch.inference_mode():
-            ours_stages = collect_ours_stages(ours, input_ids.to(args.device))
-            hf_stages = collect_hf_stages(hf, input_ids.to(args.device))
+        if ours_stages is None or hf_stages is None or ours_rope is None or hf_rope is None or ours_last_layer is None or hf_last_layer is None:
+            raise RuntimeError("layerwise artifacts were not collected")
         print_layerwise_report(ours_stages, hf_stages)
-        with torch.inference_mode():
-            compare_rope_tensors(ours, hf, input_ids.to(args.device))
-            compare_last_layer_attention(ours, hf, input_ids.to(args.device))
-            compare_last_layer_block(ours, hf, input_ids.to(args.device))
+        compare_rope_tensors(ours_rope, hf_rope)
+        last_idx = len([key for key in ours_stages if key.startswith("layer_")])
+        compare_last_layer_attention(ours_last_layer, hf_last_layer, last_idx)
+        compare_last_layer_block(ours_last_layer, hf_last_layer, last_idx)
     if args.blockwise:
+        ours = builder(device=args.device, dtype=dtype)
         with torch.inference_mode():
-            print_blockwise_report(
+            ours_blockwise = collect_blockwise_range_ours(
                 ours,
-                hf,
-                input_ids.to(args.device),
+                input_ids_device,
                 layer_start=args.blockwise_from,
                 layer_end=args.blockwise_to,
             )
+        del ours
+        release_cuda_memory()
+        hf = load_hf_model(device=args.device, dtype=dtype)
+        with torch.inference_mode():
+            hf_blockwise = collect_blockwise_range_hf(
+                hf,
+                input_ids_device,
+                layer_start=args.blockwise_from,
+                layer_end=args.blockwise_to,
+            )
+        del hf
+        release_cuda_memory()
+        print_blockwise_report(
+            ours_blockwise,
+            hf_blockwise,
+            layer_start=args.blockwise_from,
+            layer_end=args.blockwise_to,
+        )
 
 
 if __name__ == "__main__":
