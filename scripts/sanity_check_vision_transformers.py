@@ -132,6 +132,23 @@ def exact_tensor_report(name: str, ours: torch.Tensor, hf: torch.Tensor) -> None
         print(name, "max_abs_diff", diff.max().item(), "mean_abs_diff", diff.mean().item())
 
 
+def to_cpu_tree(value):
+    if isinstance(value, torch.Tensor):
+        return value.detach().cpu()
+    if isinstance(value, dict):
+        return {key: to_cpu_tree(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return tuple(to_cpu_tree(item) for item in value)
+    if isinstance(value, list):
+        return [to_cpu_tree(item) for item in value]
+    return value
+
+
+def release_cuda_memory() -> None:
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def register_tensor_hooks(module: torch.nn.Module, mapping: dict[str, torch.nn.Module]) -> tuple[dict[str, torch.Tensor], list]:
     captured: dict[str, torch.Tensor] = {}
     handles = []
@@ -236,30 +253,42 @@ def top_tokens(logits: torch.Tensor, tokenizer: LocalTokenizer, k: int) -> list[
     return [(index.item(), value.item(), tokenizer.decode_token(index.item())) for value, index in zip(values, indices, strict=True)]
 
 
-def print_multimodal_logits_report(
-    ours_model: torch.nn.Module,
-    hf_model: torch.nn.Module,
+def collect_local_multimodal_logits(
+    model: torch.nn.Module,
     input_ids: torch.Tensor,
     pixel_values: torch.Tensor,
     image_position_ids: torch.Tensor,
-    tokenizer: LocalTokenizer,
-    top_k: int,
-) -> None:
-    ours_logits = ours_model(
+) -> torch.Tensor:
+    return model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         image_position_ids=image_position_ids,
         use_cache=False,
     ).detach()
-    hf_outputs = hf_model(
+
+
+def collect_hf_multimodal_logits(
+    model: torch.nn.Module,
+    input_ids: torch.Tensor,
+    pixel_values: torch.Tensor,
+    image_position_ids: torch.Tensor,
+) -> torch.Tensor:
+    hf_outputs = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         image_position_ids=image_position_ids,
         use_cache=False,
         return_dict=True,
     )
-    hf_logits = hf_outputs.logits.detach()
+    return hf_outputs.logits.detach()
 
+
+def print_multimodal_logits_report(
+    ours_logits: torch.Tensor,
+    hf_logits: torch.Tensor,
+    tokenizer: LocalTokenizer,
+    top_k: int,
+) -> None:
     print("--- multimodal_logits ---")
     tensor_stats("logits", ours_logits, hf_logits)
     print("ours_top_tokens", top_tokens(ours_logits, tokenizer, top_k))
@@ -277,25 +306,44 @@ def main() -> None:
 
     tokenizer = LocalTokenizer()
     input_ids = tokenizer.encode_chat_prompt(args.prompt, num_soft_tokens)
+    input_ids_device = input_ids.to(device=args.device)
+    pixel_values_device = pixel_values.to(device=args.device, dtype=dtype)
+    image_position_ids_device = image_position_ids.to(device=args.device)
 
     builder = build_model if args.loader == "streamed" else build_model_naive
+
     ours_model = builder(device=args.device, dtype=dtype, include_vision=True)
+    with torch.inference_mode():
+        ours_stages = to_cpu_tree(collect_local_vision_stages(ours_model, pixel_values_device, image_position_ids_device))
+        ours_logits = to_cpu_tree(
+            collect_local_multimodal_logits(
+                ours_model,
+                input_ids_device,
+                pixel_values_device,
+                image_position_ids_device,
+            )
+        )
+    del ours_model
+    release_cuda_memory()
+
     hf_model = load_hf_model(device=args.device, dtype=dtype)
-
-    pixel_values = pixel_values.to(device=args.device, dtype=dtype)
-    image_position_ids = image_position_ids.to(device=args.device)
-    input_ids = input_ids.to(device=args.device)
-
-    ours_stages = collect_local_vision_stages(ours_model, pixel_values, image_position_ids)
-    hf_stages = collect_hf_vision_stages(hf_model, pixel_values, image_position_ids)
+    with torch.inference_mode():
+        hf_stages = to_cpu_tree(collect_hf_vision_stages(hf_model, pixel_values_device, image_position_ids_device))
+        hf_logits = to_cpu_tree(
+            collect_hf_multimodal_logits(
+                hf_model,
+                input_ids_device,
+                pixel_values_device,
+                image_position_ids_device,
+            )
+        )
+    del hf_model
+    release_cuda_memory()
 
     print_layerwise_report(ours_stages, hf_stages, skip_layerwise=args.skip_layerwise)
     print_multimodal_logits_report(
-        ours_model=ours_model,
-        hf_model=hf_model,
-        input_ids=input_ids,
-        pixel_values=pixel_values,
-        image_position_ids=image_position_ids,
+        ours_logits=ours_logits,
+        hf_logits=hf_logits,
         tokenizer=tokenizer,
         top_k=args.top_k,
     )
